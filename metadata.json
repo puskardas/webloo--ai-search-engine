@@ -1,0 +1,6 @@
+{
+  "name": "Mini Search Engine",
+  "description": "A high-performance full-stack search engine featuring real-time web crawling, inverted biological indexing, and BM25 relevance ranking.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

@@ -1,0 +1,69 @@
+{
+  "entities": {
+    "admin": {
+      "title": "Admin",
+      "description": "System administrators with elevated privileges.",
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Admin email address"
+        },
+        "addedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When this admin was added"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Name of the admin"
+        }
+      },
+      "required": [
+        "email"
+      ]
+    },
+    "user": {
+      "title": "User",
+      "description": "User profile data captured on login.",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "lastLogin": { "type": "string", "format": "date-time" },
+        "isAdmin": { "type": "boolean" }
+      },
+      "required": ["email"]
+    },
+    "audit_log": {
+      "title": "Audit Log",
+      "description": "Records of administrator actions.",
+      "type": "object",
+      "properties": {
+        "adminId": { "type": "string", "description": "UID of the admin who performed the action" },
+        "adminEmail": { "type": "string" },
+        "action": { "type": "string", "description": "Description of the action performed" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "targetId": { "type": "string", "description": "UID of the target user if applicable" },
+        "details": { "type": "string", "description": "Additional context or payload" }
+      },
+      "required": ["adminId", "action", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/admins/{uid}": {
+      "schema": "admin",
+      "description": "Collection of administrators indexed by their Firebase Auth UID."
+    },
+    "/users/{uid}": {
+      "schema": "user",
+      "description": "User profiles indexed by UID."
+    },
+    "/audit_logs/{logId}": {
+      "schema": "audit_log",
+      "description": "Collection of system audit logs."
+    }
+  }
+}
