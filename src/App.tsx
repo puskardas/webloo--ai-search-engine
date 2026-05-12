@@ -140,6 +140,10 @@ export default function App() {
   const [currentPage, setCurrentPage] = useState(1);
   const [resultsPerPage] = useState(10);
   const [isSearching, setIsSearching] = useState(false);
+  const [searchTime, setSearchTime] = useState<number>(0);
+  const [searchMetrics, setSearchMetrics] = useState<{ totalTime: number, retrievalTime: number, rankingTime: number } | null>(null);
+  const [isDeepSearching, setIsDeepSearching] = useState(false);
+  const [deepSearchSummary, setDeepSearchSummary] = useState<string | null>(null);
   const [stats, setStats] = useState<Stats | null>(null);
   const [crawlUrl, setCrawlUrl] = useState("");
   const [crawlDepth, setCrawlDepth] = useState(1);
@@ -373,8 +377,6 @@ export default function App() {
     setShowSuggestions(true);
   };
 
-  const [searchTime, setSearchTime] = useState<number>(0);
-
   const fetchStats = async () => {
     try {
       const res = await fetch("/api/analytics");
@@ -523,6 +525,7 @@ export default function App() {
     if (!activeQuery.trim() && !activeMust.trim() && !phrase.trim()) return;
     
     setFeedbackSubmitted({});
+    setDeepSearchSummary(null);
     setIsSearching(true);
     setShowSuggestions(false);
     setCurrentPage(page);
@@ -559,12 +562,40 @@ export default function App() {
       } else {
         setResults(data.results || []);
         setTotalResults(data.total || 0);
+        if (data.metrics) {
+          setSearchMetrics(data.metrics);
+        }
       }
       setSearchTime((performance.now() - start) / 1000);
     } catch (err) {
       console.error("Search failed", err);
     } finally {
       setIsSearching(false);
+    }
+  };
+
+  const handleDeepSearch = async () => {
+    if (results.length === 0) return;
+    setIsDeepSearching(true);
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      const context = results.slice(0, 5).map(r => `Title: ${r.title}\nURL: ${r.url}\nSnippet: ${r.snippet}`).join("\n\n");
+      const prompt = `You are a Search Logic Expert. Based on the following top search results for the query "${query}", provide a "Deep Insight" summary. 
+      Identify which result is likely the most authoritative and WHY (mention specific signals like technical depth, domain authority, or relevance to the query).
+      Synthesize the information from these results to answer the user's implicit intent behind the query "${query}".
+      
+      Context:\n${context}`;
+
+      const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: prompt
+      });
+
+      setDeepSearchSummary(response.text);
+    } catch (err) {
+      console.error("Deep search failed", err);
+    } finally {
+      setIsDeepSearching(false);
     }
   };
 
@@ -1429,10 +1460,88 @@ export default function App() {
               {/* Results Area */}
               <div className="flex-1 flex flex-col space-y-4 overflow-y-auto pr-2 custom-scrollbar">
                 {(results.length > 0 || imageResults.length > 0) && (
-                  <div className="flex items-center justify-between px-2 shrink-0">
-                    <p className="text-xs text-slate-500 font-medium tracking-wide">
-                      Found <span className="text-slate-800 font-bold">{searchType === "image" ? imageResults.length : totalResults}</span> candidates in {searchTime.toFixed(3)} seconds
-                    </p>
+                  <div className="flex flex-col space-y-4 px-2 shrink-0">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-4">
+                        <p className="text-xs text-slate-500 font-medium tracking-wide">
+                          Found <span className="text-slate-800 dark:text-slate-200 font-bold">{searchType === "image" ? imageResults.length : totalResults}</span> candidates in {searchTime.toFixed(3)} seconds
+                        </p>
+                        {searchMetrics && (
+                           <div className="flex items-center gap-3 border-l border-slate-200 dark:border-slate-800 pl-4">
+                              <span className="text-[9px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-tighter">Backend timing:</span>
+                              <div className="flex items-center gap-3">
+                                <span className="text-[9px] font-bold text-blue-500" title="Total logic time">Σ {searchMetrics.totalTime.toFixed(1)}ms</span>
+                                <span className="text-[9px] font-bold text-emerald-500" title="Retrieval time (Filtering)">R {searchMetrics.retrievalTime.toFixed(1)}ms</span>
+                                <span className="text-[9px] font-bold text-amber-500" title="Ranking time (BM25)">K {searchMetrics.rankingTime.toFixed(1)}ms</span>
+                              </div>
+                           </div>
+                        )}
+                      </div>
+                      {searchType === "text" && results.length > 0 && (
+                        <button 
+                          onClick={handleDeepSearch}
+                          disabled={isDeepSearching || deepSearchSummary !== null}
+                          className={`flex items-center gap-2 px-4 py-2 rounded-full text-[10px] font-bold uppercase tracking-widest transition-all shadow-sm ${
+                            deepSearchSummary 
+                              ? "bg-emerald-50 dark:bg-emerald-900/20 text-emerald-600 dark:text-emerald-400 border border-emerald-100 dark:border-emerald-900/30"
+                              : "bg-gradient-to-r from-blue-600 to-indigo-600 text-white hover:shadow-lg hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-50"
+                          }`}
+                        >
+                          {isDeepSearching ? (
+                            <>
+                              <Loader2 className="w-3 h-3 animate-spin" />
+                              Analyzing Relevance...
+                            </>
+                          ) : deepSearchSummary ? (
+                            <>
+                              <CheckCircle className="w-3 h-3" />
+                              AI Analysis Complete
+                            </>
+                          ) : (
+                            <>
+                              <Activity className="w-3 h-3" />
+                              Deep Search
+                            </>
+                          )}
+                        </button>
+                      )}
+                    </div>
+
+                    <AnimatePresence>
+                      {deepSearchSummary && (
+                        <motion.div 
+                          initial={{ opacity: 0, height: 0 }}
+                          animate={{ opacity: 1, height: "auto" }}
+                          exit={{ opacity: 0, height: 0 }}
+                          className="bg-gradient-to-br from-blue-50 to-indigo-50 dark:from-blue-900/10 dark:to-indigo-900/10 border border-blue-100 dark:border-blue-900/30 rounded-xl p-6 shadow-sm overflow-hidden relative"
+                        >
+                          <div className="absolute top-4 right-4 text-blue-600/10 dark:text-blue-400/10 ring-1 ring-blue-600/5 dark:ring-blue-400/5 rounded p-1">
+                            <Activity className="w-12 h-12" />
+                          </div>
+                          <h4 className="text-[10px] font-bold text-blue-600 dark:text-blue-400 uppercase tracking-widest mb-3 flex items-center gap-2">
+                            <Shield className="w-3.5 h-3.5" />
+                            AI-Powered Search Intelligence & Synthesis
+                          </h4>
+                          <div className="prose prose-sm dark:prose-invert max-w-none">
+                            <p className="text-sm text-slate-700 dark:text-slate-300 leading-relaxed whitespace-pre-wrap">
+                              {deepSearchSummary}
+                            </p>
+                          </div>
+                          <div className="mt-4 pt-4 border-t border-blue-100 dark:border-blue-900/30 flex items-center justify-between">
+                             <p className="text-[9px] text-blue-500 dark:text-blue-400/60 font-bold uppercase tracking-tighter">
+                               Model: Gemini 3.1 Flash Preview • Synthesis based on top 5 retrieved documents
+                             </p>
+                             <button 
+                               onClick={() => setDeepSearchSummary(null)}
+                               className="text-[9px] font-bold text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 uppercase"
+                             >
+                               Dismiss Analysis
+                             </button>
+                          </div>
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+
                     {searchType === "text" && (
                       <div className="flex items-center space-x-6 text-[9px] font-bold text-slate-400 tracking-[0.1em]">
                         <div className="flex items-center space-x-2">

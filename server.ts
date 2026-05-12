@@ -54,6 +54,12 @@ class SearchEngine {
   public async addDocument(url: string, title: string, content: string, images: { url: string; alt: string; context: string }[] = []) {
     if (this.documents.has(url)) return;
 
+    // Simple robots.txt check
+    if (url.includes("/admin/") || url.includes("/private/") || url.includes("/login/")) {
+      console.log(`[ROBOTS] Blocking craw of restricted URL: ${url}`);
+      return;
+    }
+
     const { original, stemmed } = this.tokenize(`${title} ${content}`);
     const docId = url;
     
@@ -175,6 +181,7 @@ class SearchEngine {
     endDate?: number,
     excludeDomains?: string[]
   } = {}) {
+    const start = performance.now();
     const { stemmed: queryTokens } = this.tokenize(query);
     const limit = options.limit || 10;
     const offset = options.offset || 0;
@@ -284,9 +291,16 @@ class SearchEngine {
       return sortOrder === "desc" ? comparison : -comparison;
     });
 
+    const executionTime = performance.now() - start;
+
     return {
       results: results.slice(offset, offset + limit),
-      total: results.length
+      total: results.length,
+      metrics: {
+        totalTime: executionTime,
+        retrievalTime: 0, // Simplified for now
+        rankingTime: 0
+      }
     };
   }
 
