@@ -32,6 +32,7 @@ class SearchEngine {
   private invertedIndex: Map<string, Set<string>> = new Map();
   private docLengths: Map<string, number> = new Map();
   private avgDocLength: number = 0;
+  private status: string = "Idle";
   
   // BM25 parameters
   private readonly k1 = 1.2;
@@ -112,11 +113,13 @@ class SearchEngine {
     let maxMatches = -1;
 
     for (const sentence of sentences) {
-      if (sentence.length < 10) continue;
+      if (sentence.length < 15) continue;
       const lowerSentence = sentence.toLowerCase();
       let matches = 0;
       for (const token of lowerTokens) {
-        if (lowerSentence.includes(token)) matches++;
+        if (lowerSentence.includes(token)) {
+          matches += token.length > 3 ? 2 : 1; // Prioritize longer token matches
+        }
       }
       if (matches > maxMatches) {
         maxMatches = matches;
@@ -124,10 +127,37 @@ class SearchEngine {
       }
     }
 
-    if (!bestSentence) return content.substring(0, 200) + "...";
+    if (!bestSentence) {
+      // If no good sentence found, try to find the first occurrence of any token
+      for (const token of lowerTokens) {
+        const idx = content.toLowerCase().indexOf(token);
+        if (idx !== -1) {
+          const start = Math.max(0, idx - 100);
+          const end = Math.min(content.length, idx + 150);
+          return (start > 0 ? "..." : "") + content.substring(start, end).trim() + "...";
+        }
+      }
+      return content.substring(0, 250) + "...";
+    }
     
-    // Limit length
+    // Limit length and ensure it's around the match if it's very long
     if (bestSentence.length > 250) {
+      // Find the first matching token in the best sentence to center the snippet
+      let firstMatchIdx = -1;
+      for (const token of lowerTokens) {
+        const idx = bestSentence.toLowerCase().indexOf(token);
+        if (idx !== -1) {
+          firstMatchIdx = idx;
+          break;
+        }
+      }
+      
+      if (firstMatchIdx !== -1) {
+        const start = Math.max(0, firstMatchIdx - 100);
+        const end = Math.min(bestSentence.length, start + 250);
+        return (start > 0 ? "..." : "") + bestSentence.substring(start, end).trim() + "...";
+      }
+      
       return bestSentence.substring(0, 250) + "...";
     }
     return bestSentence + ".";
@@ -140,7 +170,10 @@ class SearchEngine {
     limit?: number,
     offset?: number,
     sortBy?: "relevance" | "date" | "url",
-    sortOrder?: "asc" | "desc"
+    sortOrder?: "asc" | "desc",
+    startDate?: number,
+    endDate?: number,
+    excludeDomains?: string[]
   } = {}) {
     const { stemmed: queryTokens } = this.tokenize(query);
     const limit = options.limit || 10;
@@ -168,7 +201,7 @@ class SearchEngine {
       return { results: [], total: 0 };
     }
 
-    // 2. Filter by Boolean Constraints (AND / NOT)
+    // 2. Filter by Boolean Constraints (AND / NOT / Date / Domain)
     const filteredCandidates = Array.from(candidates).filter(docId => {
       const doc = this.documents.get(docId)!;
       
@@ -184,6 +217,16 @@ class SearchEngine {
           const { stemmed: tokens } = this.tokenize(mustQuery);
           if (!tokens.every(t => doc.stemmedTokens.includes(t))) return false;
         }
+      }
+
+      if (options.startDate && doc.indexedAt < options.startDate) return false;
+      if (options.endDate && doc.indexedAt > options.endDate) return false;
+
+      if (options.excludeDomains && options.excludeDomains.length > 0) {
+        try {
+          const docDomain = new URL(doc.url).hostname;
+          if (options.excludeDomains.some(d => docDomain.toLowerCase().includes(d.toLowerCase().trim()))) return false;
+        } catch (e) {}
       }
 
       if (options.phrase) {
@@ -329,9 +372,26 @@ class SearchEngine {
 
     return {
       ...this.getStats(),
+      status: this.status,
       topTerms,
       domainDist: Object.entries(domains).map(([name, value]) => ({ name, value }))
     };
+  }
+
+  public setStatus(s: string) {
+    this.status = s;
+    if (s !== "Idle") {
+      console.log(`[STATUS] ${s}`);
+    }
+  }
+
+  public clear() {
+    this.documents.clear();
+    this.imageIndex = [];
+    this.invertedIndex.clear();
+    this.docLengths.clear();
+    this.avgDocLength = 0;
+    console.log("Search engine index cleared.");
   }
 }
 
@@ -339,10 +399,48 @@ const engine = new SearchEngine();
 
 // --- Crawler Logic ---
 
+const SEED_URLS = [
+  "https://en.wikipedia.org/wiki/Web_crawler",
+  "https://en.wikipedia.org/wiki/Information_retrieval",
+  "https://developer.mozilla.org/en-US/docs/Web/HTTP",
+  "https://github.com/trending"
+];
+
+async function automateDiscovery() {
+  console.log("[AUTO] Starting automated discovery sequence...");
+  for (const url of SEED_URLS) {
+    if (engine.getStats().documents > 100) break; // Don't over-crawl automatically
+    try {
+      await crawl(url, 1, new Set());
+    } catch (e) {
+      console.error(`[AUTO] Discovery failed for ${url}:`, e);
+    }
+  }
+  console.log("[AUTO] Discovery sequence finalized.");
+  engine.setStatus("Idle");
+}
+
+async function startAutoMaintenance() {
+  // Re-crawl a random existing domain every 2 hours to keep fresh
+  setInterval(async () => {
+    const stats = engine.getAnalyticsData();
+    if (stats.domainDist.length > 0) {
+      const randomDomain = stats.domainDist[Math.floor(Math.random() * stats.domainDist.length)].name;
+      const existingDocs = Array.from((engine as any).documents.values()) as Document[];
+      const domainDoc = existingDocs.find(d => d.url.includes(randomDomain));
+      if (domainDoc) {
+        console.log(`[MAINTENANCE] Refreshing ${randomDomain}...`);
+        await crawl(domainDoc.url, 0, new Set());
+      }
+    }
+  }, 1000 * 60 * 60 * 2); 
+}
+
 async function crawl(url: string, depth = 1, visited = new Set<string>()) {
   if (visited.has(url) || depth < 0) return;
   visited.add(url);
 
+  engine.setStatus(`Crawling: ${url}`);
   try {
     const response = await axios.get(url, {
       timeout: 5000,
@@ -403,8 +501,26 @@ async function startServer() {
   app.use(express.json());
 
   // API Routes
+  app.get("/api/health", (req, res) => {
+    res.json({ status: "ok", timestamp: Date.now() });
+  });
+
   app.get("/api/analytics", (req, res) => {
-    res.json(engine.getAnalyticsData());
+    try {
+      res.json(engine.getAnalyticsData());
+    } catch (err) {
+      console.error("Analytics error:", err);
+      res.status(500).json({ error: "Failed to collect analytics" });
+    }
+  });
+
+  // Alias for analytics
+  app.get("/api/stats", (req, res) => {
+    try {
+      res.json(engine.getAnalyticsData());
+    } catch (err) {
+      res.status(500).json({ error: "Failed to collect stats" });
+    }
   });
 
   app.post("/api/crawl", async (req, res) => {
@@ -413,38 +529,61 @@ async function startServer() {
     
     console.log(`Starting crawl for ${url} (depth: ${depth})`);
     // Run in background
+    engine.setStatus(`Preparing crawl for ${url}...`);
     crawl(url, depth).then(() => {
       console.log(`Finished crawling scope of ${url}`);
+      engine.setStatus("Idle");
+    }).catch(err => {
+      console.error(`Crawl failed for ${url}:`, err);
+      engine.setStatus("Idle");
     });
     
     res.json({ message: "Crawl started" });
   });
 
-  app.get("/api/search", (req, res) => {
-    const { q, type, must, not, phrase, page, limit, sortBy, sortOrder } = req.query;
-    
-    const p = parseInt(String(page)) || 1;
-    const l = parseInt(String(limit)) || 10;
-    const offset = (p - 1) * l;
-
-    if (type === "image") {
-      const results = engine.searchImages(q ? String(q) : "");
-      return res.json({ results, total: results.length });
+  app.post("/api/clear", (req, res) => {
+    try {
+      engine.clear();
+      res.json({ message: "Cache cleared successfully" });
+    } catch (err) {
+      console.error("Clear error:", err);
+      res.status(500).json({ error: "Failed to clear search index" });
     }
+  });
 
-    // Parse complex queries if provided
-    const options = {
-      mustTokens: must ? String(must).split(",") : undefined,
-      notTokens: not ? String(not).split(",") : undefined,
-      phrase: phrase ? String(phrase) : undefined,
-      limit: l,
-      offset: offset,
-      sortBy: sortBy ? (String(sortBy) as any) : undefined,
-      sortOrder: sortOrder ? (String(sortOrder) as any) : undefined
-    };
+  app.get("/api/search", (req, res) => {
+    try {
+      const { q, type, must, not, phrase, page, limit, sortBy, sortOrder, start, end, exclude } = req.query;
+      
+      const p = parseInt(String(page)) || 1;
+      const l = parseInt(String(limit)) || 10;
+      const offset = (p - 1) * l;
 
-    const searchResponse = engine.search(q ? String(q) : "", options);
-    res.json(searchResponse);
+      if (type === "image") {
+        const results = engine.searchImages(q ? String(q) : "");
+        return res.json({ results, total: results.length });
+      }
+
+      // Parse complex queries if provided
+      const options = {
+        mustTokens: must ? String(must).split(",") : undefined,
+        notTokens: not ? String(not).split(",") : undefined,
+        phrase: phrase ? String(phrase) : undefined,
+        limit: l,
+        offset: offset,
+        sortBy: sortBy ? (String(sortBy) as any) : undefined,
+        sortOrder: sortOrder ? (String(sortOrder) as any) : undefined,
+        startDate: start ? parseInt(String(start)) : undefined,
+        endDate: end ? parseInt(String(end)) : undefined,
+        excludeDomains: exclude ? String(exclude).split(",") : undefined
+      };
+
+      const searchResponse = engine.search(q ? String(q) : "", options);
+      res.json(searchResponse);
+    } catch (err) {
+      console.error("Search error:", err);
+      res.status(500).json({ error: "Search failed" });
+    }
   });
 
   app.post("/api/image/features", (req, res) => {
@@ -462,9 +601,18 @@ async function startServer() {
   });
 
   app.get("/api/suggest", (req, res) => {
-    const { q } = req.query;
-    if (!q) return res.json([]);
-    res.json(engine.getSuggestions(String(q)));
+    try {
+      const { q } = req.query;
+      if (!q) return res.json([]);
+      res.json(engine.getSuggestions(String(q)));
+    } catch (err) {
+      res.json([]);
+    }
+  });
+
+  // Catch all for unmatched API routes
+  app.all("/api/*", (req, res) => {
+    res.status(404).json({ error: "API route not found" });
   });
 
   // Vite/Static serving
@@ -482,6 +630,15 @@ async function startServer() {
     });
   }
 
+  // Error handler middleware
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    console.error("Unhandled Express error:", err);
+    if (res.headersSent) {
+      return next(err);
+    }
+    res.status(500).json({ error: "Internal Server Error", details: err.message });
+  });
+
   const PORT = 3000;
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Search engine server running at http://localhost:${PORT}`);
@@ -489,10 +646,22 @@ async function startServer() {
 }
 
 // Pre-seed with some pages if empty
-(async () => {
-  await engine.addDocument("https://en.wikipedia.org/wiki/Search_engine", "Search engine - Wikipedia", "A search engine is a software system that is designed to carry out web search (Internet search), which means to search the World Wide Web in a systematic way for particular information specified in a textual web search query.");
-  await engine.addDocument("https://en.wikipedia.org/wiki/Inverted_index", "Inverted index - Wikipedia", "In computer science, an inverted index (also referred to as a postings file or index) is a database index storing a mapping from content, such as words or numbers, to its locations in a table, or in a document or a set of documents.");
-  await engine.addDocument("https://en.wikipedia.org/wiki/Okapi_BM25", "Okapi BM25 - Wikipedia", "Okapi BM25 is a ranking function used by search engines to estimate the relevance of documents to a given search query.");
-})();
+const seedData = async () => {
+  try {
+    await engine.addDocument("https://en.wikipedia.org/wiki/Search_engine", "Search engine - Wikipedia", "A search engine is a software system that is designed to carry out web search (Internet search), which means to search the World Wide Web in a systematic way for particular information specified in a textual web search query.");
+    await engine.addDocument("https://en.wikipedia.org/wiki/Inverted_index", "Inverted index - Wikipedia", "In computer science, an inverted index (also referred to as a postings file or index) is a database index storing a mapping from content, such as words or numbers, to its locations in a table, or in a document or a set of documents.");
+    await engine.addDocument("https://en.wikipedia.org/wiki/Okapi_BM25", "Okapi BM25 - Wikipedia", "Okapi BM25 is a ranking function used by search engines to estimate the relevance of documents to a given search query.");
+    console.log("Seeding completed successfully.");
+  } catch (err) {
+    console.error("Seeding failed:", err);
+  }
+};
 
-startServer();
+startServer().then(() => {
+  seedData().then(() => {
+    automateDiscovery();
+    startAutoMaintenance();
+  });
+}).catch(err => {
+  console.error("Failed to start server:", err);
+});

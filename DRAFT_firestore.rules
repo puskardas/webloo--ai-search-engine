@@ -63,19 +63,5 @@ service cloud.firestore {
       allow create: if isAdmin() && isValidAuditLog(incoming());
       allow update, delete: if false;
     }
-
-    match /search_feedback/{feedbackId} {
-      function isValidFeedback(data) {
-        return data.keys().hasAll(['query', 'resultUrl', 'isRelevant', 'timestamp']) &&
-               data.query is string && data.query.size() > 0 &&
-               data.resultUrl is string && data.resultUrl.size() > 0 &&
-               data.isRelevant is bool &&
-               data.timestamp == request.time &&
-               (data.keys().size() == 4 || (data.keys().size() == 5 && data.userId == request.auth.uid));
-      }
-      allow read: if isAdmin();
-      allow create: if isSignedIn() && isValidFeedback(incoming());
-      allow update, delete: if false;
-    }
   }
 }

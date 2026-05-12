@@ -1,17 +1,64 @@
 import React, { useState, useEffect } from "react";
-import { Search, Globe, Database, Settings, ChevronRight, Loader2, Plus, Info, Activity, BarChart3, Layout, ChevronLeft, Image as ImageIcon, Upload, X, Moon, Sun, LogIn, LogOut, Shield, Users, UserPlus, UserMinus, Trash2, CheckCircle, Clock } from "lucide-react";
+import { Search, Globe, Database, Settings, ChevronRight, Loader2, Plus, Info, Activity, BarChart3, Layout, ChevronLeft, Image as ImageIcon, Upload, X, Moon, Sun, LogIn, LogOut, Shield, Users, UserPlus, UserMinus, Trash2, CheckCircle, Clock, ThumbsUp, ThumbsDown } from "lucide-react";
 import { GoogleGenAI } from "@google/genai";
 import { motion, AnimatePresence } from "motion/react";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInWithPopup, GoogleAuthProvider, onAuthStateChanged, User, signOut } from 'firebase/auth';
-import { getFirestore, doc, setDoc, getDoc, getDocs, collection, deleteDoc, query, orderBy, serverTimestamp, arrayUnion, arrayRemove, addDoc, limit } from 'firebase/firestore';
+import { getFirestore, doc, setDoc, getDoc, getDocs, collection, deleteDoc, query, orderBy, serverTimestamp, arrayUnion, arrayRemove, addDoc, limit, writeBatch } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 const provider = new GoogleAuthProvider();
+
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+    tenantId?: string | null;
+    providerInfo?: {
+      providerId?: string | null;
+      email?: string | null;
+    }[];
+  }
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData?.map(provider => ({
+        providerId: provider.providerId,
+        email: provider.email,
+      })) || []
+    },
+    operationType,
+    path
+  }
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
 
 interface SearchResult {
   url: string;
@@ -25,6 +72,12 @@ interface Stats {
   documents: number;
   terms: number;
   images: number;
+  status?: string;
+  feedback?: {
+    total: number;
+    relevant: number;
+    notRelevant: number;
+  };
   topTerms: { term: string, count: number }[];
   domainDist: { name: string, value: number }[];
 }
@@ -93,19 +146,23 @@ export default function App() {
   const [isCrawling, setIsCrawling] = useState(false);
   const [showCrawler, setShowCrawler] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [startDate, setStartDate] = useState("");
+  const [endDate, setEndDate] = useState("");
+  const [excludeDomains, setExcludeDomains] = useState("");
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [sortBy, setSortBy] = useState<"relevance" | "date" | "url">("relevance");
   const [sortOrder, setSortOrder] = useState<"asc" | "desc">("desc");
-  const [view, setView] = useState<"search" | "dashboard" | "admins" | "audit">("search");
+  const [view, setView] = useState<"search" | "dashboard" | "admins" | "audit" | "profile">("search");
   const [viewImage, setViewImage] = useState<ImageResult | null>(null);
   const [editingAlt, setEditingAlt] = useState("");
   const [isUpdatingAlt, setIsUpdatingAlt] = useState(false);
   const [hasSearched, setHasSearched] = useState(false);
+  const [crawlError, setCrawlError] = useState("");
 
   useEffect(() => {
     const saved = localStorage.getItem("theme");
-    const isDark = saved === "dark" || (!saved && window.matchMedia("(pre-hooks/color-scheme: dark)").matches);
+    const isDark = saved === "dark" || (!saved && window.matchMedia("(prefers-color-scheme: dark)").matches);
     setDarkMode(isDark);
   }, []);
 
@@ -321,7 +378,24 @@ export default function App() {
   const fetchStats = async () => {
     try {
       const res = await fetch("/api/analytics");
+      if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
       const data = await res.json();
+      
+      // If admin, also fetch feedback stats from Firestore
+      if (isAdmin) {
+        try {
+          const feedbackSnap = await getDocs(collection(db, "search_feedback"));
+          const feedbackDocs = feedbackSnap.docs.map(d => d.data());
+          data.feedback = {
+            total: feedbackDocs.length,
+            relevant: feedbackDocs.filter((d: any) => d.isRelevant).length,
+            notRelevant: feedbackDocs.filter((d: any) => !d.isRelevant).length
+          };
+        } catch (e) {
+          console.error("Failed to fetch feedback stats", e);
+        }
+      }
+      
       setStats(data);
     } catch (err) {
       console.error("Failed to fetch stats", err);
@@ -330,34 +404,110 @@ export default function App() {
 
   useEffect(() => {
     fetchStats();
-    const interval = setInterval(fetchStats, 5000);
+    const interval = setInterval(fetchStats, 10000);
     return () => clearInterval(interval);
   }, []);
 
   const [searchHistory, setSearchHistory] = useState<string[]>([]);
+  const [feedbackSubmitted, setFeedbackSubmitted] = useState<Record<string, boolean>>({});
 
-  useEffect(() => {
-    const saved = localStorage.getItem("search_history");
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) setSearchHistory(parsed as string[]);
-      } catch (e) {
-        console.error("Failed to parse history", e);
-      }
+  const handleFeedback = async (resUrl: string, isRelevant: boolean) => {
+    // Only allow feedback if signed in
+    if (!user) {
+      alert("Please sign in to provide feedback.");
+      return;
     }
-  }, []);
 
-  const addToHistory = (q: string) => {
-    if (!q.trim()) return;
-    const newHistory = [q, ...searchHistory.filter(h => h !== q)].slice(0, 10);
-    setSearchHistory(newHistory);
-    localStorage.setItem("search_history", JSON.stringify(newHistory));
+    const feedbackKey = `${query}-${resUrl}`;
+    if (feedbackSubmitted[feedbackKey]) return;
+
+    const path = "search_feedback";
+    try {
+      await addDoc(collection(db, path), {
+        userId: user.uid,
+        query: query,
+        resultUrl: resUrl,
+        isRelevant: isRelevant,
+        timestamp: serverTimestamp()
+      });
+      setFeedbackSubmitted(prev => ({ ...prev, [feedbackKey]: true }));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, path);
+    }
   };
 
-  const clearHistory = () => {
+  const fetchSearchHistory = async (u: User) => {
+    const path = `users/${u.uid}/search_history`;
+    try {
+      const q = query(collection(db, path), orderBy("timestamp", "desc"), limit(10));
+      const snap = await getDocs(q);
+      const history = snap.docs.map(doc => (doc.data() as { query: string }).query);
+      setSearchHistory(history);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.LIST, path);
+    }
+  };
+
+  useEffect(() => {
+    if (!user) {
+      const saved = localStorage.getItem("search_history");
+      if (saved) {
+        try {
+          const parsed = JSON.parse(saved);
+          if (Array.isArray(parsed)) setSearchHistory(parsed as string[]);
+        } catch (e) {
+          console.error("Failed to parse history", e);
+        }
+      }
+    } else {
+      fetchSearchHistory(user);
+    }
+  }, [user]);
+
+  const addToHistory = async (q: string) => {
+    if (!q.trim()) return;
+    
+    // Update local state first
+    const newHistory = [q, ...searchHistory.filter(h => h !== q)].slice(0, 10);
+    setSearchHistory(newHistory);
+    
+    if (user) {
+      const path = `users/${user.uid}/search_history`;
+      try {
+        // Check if query already exists to avoid duplication in Firestore (optional but nice)
+        // For simplicity, we just add a new entry. A more robust way would be to update the timestamp of an existing one.
+        await addDoc(collection(db, path), {
+          userId: user.uid,
+          query: q,
+          timestamp: serverTimestamp(),
+          type: searchType
+        });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.CREATE, path);
+      }
+    } else {
+      localStorage.setItem("search_history", JSON.stringify(newHistory));
+    }
+  };
+
+  const clearHistory = async () => {
     setSearchHistory([]);
-    localStorage.removeItem("search_history");
+    if (user) {
+      const path = `users/${user.uid}/search_history`;
+      try {
+        const q = query(collection(db, path));
+        const snap = await getDocs(q);
+        const batch = writeBatch(db);
+        snap.docs.forEach((doc) => {
+          batch.delete(doc.ref);
+        });
+        await batch.commit();
+      } catch (err) {
+        handleFirestoreError(err, OperationType.WRITE, path); // Using WRITE pattern for batch
+      }
+    } else {
+      localStorage.removeItem("search_history");
+    }
   };
 
   useEffect(() => {
@@ -372,6 +522,7 @@ export default function App() {
     const activeMust = overrideMust !== undefined ? overrideMust : mustWords;
     if (!activeQuery.trim() && !activeMust.trim() && !phrase.trim()) return;
     
+    setFeedbackSubmitted({});
     setIsSearching(true);
     setShowSuggestions(false);
     setCurrentPage(page);
@@ -385,6 +536,15 @@ export default function App() {
       if (activeMust) params.append("must", activeMust.split(" ").join(","));
       if (notWords) params.append("not", notWords.split(" ").join(","));
       if (phrase) params.append("phrase", phrase);
+      if (startDate) {
+        const d = new Date(startDate);
+        if (!isNaN(d.getTime())) params.append("start", String(d.getTime()));
+      }
+      if (endDate) {
+        const d = new Date(endDate);
+        if (!isNaN(d.getTime())) params.append("end", String(d.getTime()));
+      }
+      if (excludeDomains) params.append("exclude", excludeDomains.split(" ").join(","));
       params.append("page", String(page));
       params.append("limit", String(resultsPerPage));
       params.append("sortBy", sortBy);
@@ -485,53 +645,87 @@ export default function App() {
 
   const totalPages = Math.ceil(totalResults / resultsPerPage);
 
+  const isValidUrl = (url: string) => {
+    try {
+      const u = new URL(url);
+      return u.protocol === "http:" || u.protocol === "https:";
+    } catch (e) {
+      return false;
+    }
+  };
+
   const handleCrawl = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!crawlUrl.trim()) return;
+    const trimmed = crawlUrl.trim();
+    if (!trimmed) return;
+    
+    if (!isValidUrl(trimmed)) {
+      setCrawlError("Please enter a valid URL (e.g., https://example.com)");
+      setTimeout(() => setCrawlError(""), 3000);
+      return;
+    }
+
+    setCrawlError("");
     setIsCrawling(true);
     try {
       await fetch("/api/crawl", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: crawlUrl, depth: crawlDepth }),
+        body: JSON.stringify({ url: trimmed, depth: crawlDepth }),
       });
-      await logAdminAction("INITIATE_CRAWL", undefined, `Started indexing from ${crawlUrl} (depth: ${crawlDepth})`);
+      await logAdminAction("INITIATE_CRAWL", undefined, `Started indexing from ${trimmed} (depth: ${crawlDepth})`);
       setCrawlUrl("");
       setCrawlDepth(1);
       setShowCrawler(false);
     } catch (err) {
       console.error("Crawl request failed", err);
+      setCrawlError("Failed to initiate crawl. Please try again.");
     } finally {
       setIsCrawling(false);
       setTimeout(fetchStats, 1000);
     }
   };
 
-  const GoogleLogo = ({ size = "text-6xl" }: { size?: string }) => {
+  const handleClearCache = async () => {
+    if (!window.confirm("Are you sure you want to clear the entire search index? This action cannot be undone.")) return;
+    
+    try {
+      const res = await fetch("/api/clear", { method: "POST" });
+      if (res.ok) {
+        setResults([]);
+        setImageResults([]);
+        setTotalResults(0);
+        await logAdminAction("CLEAR_INDEX", undefined, "Cleared the entire search engine index");
+        fetchStats();
+        alert("Index cleared successfully.");
+      }
+    } catch (err) {
+      console.error("Failed to clear index", err);
+      alert("Failed to clear index.");
+    }
+  };
+
+  const WeblooLogo = ({ size = "text-6xl" }: { size?: string }) => {
     const letters = [
-      { char: 'M', color: 'text-blue-500' },
-      { char: 'i', color: 'text-red-500' },
-      { char: 'n', color: 'text-yellow-500' },
-      { char: 'i', color: 'text-blue-500' },
-      { char: 'S', color: 'text-green-500' },
+      { char: 'W', color: 'text-blue-500' },
       { char: 'e', color: 'text-red-500' },
-      { char: 'a', color: 'text-blue-500' },
-      { char: 'r', color: 'text-red-500' },
-      { char: 'c', color: 'text-yellow-500' },
-      { char: 'h', color: 'text-blue-500' },
+      { char: 'b', color: 'text-yellow-500' },
+      { char: 'l', color: 'text-blue-500' },
+      { char: 'o', color: 'text-green-500' },
+      { char: 'o', color: 'text-red-500' },
     ];
 
     return (
       <div className={`flex font-bold ${size} tracking-tighter select-none`}>
         {letters.map((l, i) => (
-          <span key={i} className={darkMode ? 'text-white' : l.color}>
+          <span key={i} className={`${l.color} dark:text-slate-100 transition-colors`}>
             {l.char}
           </span>
         ))}
       </div>
     );
   };
-  const highlightText = (text: string, queries: string[]): JSX.Element | string => {
+  const highlightText = (text: string, queries: string[]): React.ReactNode => {
     if (!queries.length || !text) return text;
     
     // Escape special characters in tokens for regex
@@ -556,7 +750,7 @@ export default function App() {
             new RegExp(`^${token}$`, 'i').test(part)
           );
           return isMatch ? (
-            <mark key={i} className="bg-yellow-200 dark:bg-yellow-800 text-slate-900 dark:text-slate-100 px-0.5 rounded font-medium">
+            <mark key={i} className="bg-yellow-200 dark:bg-yellow-500/30 text-yellow-950 dark:text-[#fbbc04] px-1 rounded-sm font-bold shadow-sm">
               {part}
             </mark>
           ) : (
@@ -597,13 +791,13 @@ export default function App() {
   };
 
   return (
-    <div className="h-screen flex flex-col bg-slate-50 dark:bg-slate-950 text-slate-800 dark:text-slate-200 font-sans transition-colors duration-300 overflow-hidden" onClick={() => setShowSuggestions(false)}>
+    <div className="h-screen flex flex-col bg-white dark:bg-[#1a1b1e] text-slate-800 dark:text-slate-200 font-sans transition-colors duration-300 overflow-hidden" onClick={() => setShowSuggestions(false)}>
       {/* Header - Minimal unless on Results page */}
-      <header className={`bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 px-6 py-3 flex items-center justify-between shrink-0 transition-all duration-500 ${!hasSearched ? 'bg-transparent border-transparent' : ''}`}>
+      <header className={`bg-white dark:bg-[#1a1b1e] border-b border-slate-200 dark:border-[#2d2e32] px-6 py-3 flex items-center justify-between shrink-0 transition-all duration-500 ${!hasSearched ? 'bg-white/0 border-transparent' : ''}`}>
         <div className={`flex items-center space-x-3 transition-opacity duration-500 ${!hasSearched ? 'opacity-0' : 'opacity-100'}`}>
           <div onClick={() => setHasSearched(false)} className="cursor-pointer group flex items-center gap-2">
-            <GoogleLogo size="text-2xl" />
-            <span className="text-blue-600 font-medium text-[10px] tracking-widest uppercase mt-1">Engine</span>
+            <WeblooLogo size="text-2xl" />
+            <span className="text-blue-600 font-medium text-[10px] tracking-widest uppercase mt-1">Search</span>
           </div>
         </div>
 
@@ -628,25 +822,32 @@ export default function App() {
 
             {user ? (
               <div className="flex items-center space-x-3 pl-2 border-l border-slate-200 dark:border-slate-800">
-                <div className="text-right hidden sm:block">
-                  <p className="text-[10px] font-bold text-slate-800 dark:text-slate-100 uppercase tracking-tighter leading-tight">{user.displayName || 'User'}</p>
-                  <p className="text-[9px] text-slate-400 dark:text-slate-500 uppercase font-bold tracking-widest leading-tight">
-                    {isAdmin ? "Administrator" : "Guest User"}
-                  </p>
-                </div>
-                {user.photoURL ? (
-                  <img src={user.photoURL} className="w-8 h-8 rounded-full border border-slate-200 dark:border-slate-700 shadow-sm" alt="Profile" />
-                ) : (
-                  <div className="w-8 h-8 rounded-full bg-blue-100 dark:bg-blue-900 flex items-center justify-center text-blue-600 dark:text-blue-400">
-                    <LogIn className="w-4 h-4" />
-                  </div>
-                )}
                 <button 
-                  onClick={handleLogout}
-                  className="p-1 px-2 text-[10px] font-bold uppercase text-red-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30 rounded transition-colors"
+                  onClick={() => setView("profile")}
+                  className="flex items-center space-x-3 hover:bg-slate-50 dark:hover:bg-slate-800/40 p-1.5 rounded-lg transition-all"
                 >
-                  Logout
+                  <div className="text-right hidden sm:block">
+                    <p className="text-[10px] font-bold text-slate-800 dark:text-slate-100 uppercase tracking-tighter leading-tight">{user.displayName || 'User'}</p>
+                    <p className="text-[9px] text-slate-400 dark:text-slate-500 uppercase font-bold tracking-widest leading-tight">
+                      {isAdmin ? "Administrator" : "Guest User"}
+                    </p>
+                  </div>
+                  {user.photoURL ? (
+                    <img src={user.photoURL} className="w-8 h-8 rounded-full border border-slate-200 dark:border-slate-700 shadow-sm" alt="Profile" />
+                  ) : (
+                    <div className="w-8 h-8 rounded-full bg-blue-100 dark:bg-blue-900 flex items-center justify-center text-blue-600 dark:text-blue-400">
+                      <Clock className="w-4 h-4" />
+                    </div>
+                  )}
                 </button>
+                <div className="flex flex-col gap-1 pr-2">
+                  <button 
+                    onClick={handleLogout}
+                    className="p-1 px-2 text-[8px] font-bold uppercase text-red-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30 rounded transition-colors"
+                  >
+                    Logout
+                  </button>
+                </div>
               </div>
             ) : (
               <button 
@@ -690,13 +891,13 @@ export default function App() {
         {isAdmin && view === "search" && hasSearched && (
           <aside className="col-span-1 md:col-span-3 flex flex-col space-y-6 overflow-y-auto pr-2 custom-scrollbar">
             {/* View Switcher */}
-            <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-1 shadow-sm flex rounded-lg shrink-0">
+            <div className="bg-white dark:bg-[#303134] border border-slate-200 dark:border-[#3c4043] p-1 shadow-sm flex rounded-lg shrink-0">
             <button 
               onClick={() => setView("search")}
               className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-md text-[10px] font-bold uppercase tracking-wider transition-all ${
                 view === "search" 
-                  ? "bg-slate-800 dark:bg-blue-600 text-white shadow-md" 
-                  : "text-slate-400 dark:text-slate-500 hover:text-slate-600 dark:hover:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800"
+                  ? "bg-slate-800 dark:bg-blue-500 text-white shadow-md font-bold" 
+                  : "text-slate-400 dark:text-slate-500 hover:text-slate-600 dark:hover:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800/40"
               }`}
             >
               <Search className="w-3.5 h-3.5" />
@@ -706,8 +907,8 @@ export default function App() {
               onClick={() => setView("dashboard")}
               className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-md text-[10px] font-bold uppercase tracking-wider transition-all ${
                 view === "dashboard" 
-                  ? "bg-slate-800 dark:bg-blue-600 text-white shadow-md" 
-                  : "text-slate-400 dark:text-slate-500 hover:text-slate-600 dark:hover:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800"
+                  ? "bg-slate-800 dark:bg-blue-500 text-white shadow-md font-bold" 
+                  : "text-slate-400 dark:text-slate-500 hover:text-slate-600 dark:hover:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800/40"
               }`}
             >
               <BarChart3 className="w-3.5 h-3.5" />
@@ -717,8 +918,8 @@ export default function App() {
               onClick={() => setView("admins")}
               className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-md text-[10px] font-bold uppercase tracking-wider transition-all ${
                 view === "admins" 
-                  ? "bg-slate-800 dark:bg-blue-600 text-white shadow-md" 
-                  : "text-slate-400 dark:text-slate-500 hover:text-slate-600 dark:hover:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800"
+                  ? "bg-slate-800 dark:bg-blue-500 text-white shadow-md font-bold" 
+                  : "text-slate-400 dark:text-slate-500 hover:text-slate-600 dark:hover:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800/40"
               }`}
             >
               <Shield className="w-3.5 h-3.5" />
@@ -728,8 +929,8 @@ export default function App() {
               onClick={() => setView("audit")}
               className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-md text-[10px] font-bold uppercase tracking-wider transition-all ${
                 view === "audit" 
-                  ? "bg-slate-800 dark:bg-blue-600 text-white shadow-md" 
-                  : "text-slate-400 dark:text-slate-500 hover:text-slate-600 dark:hover:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800"
+                  ? "bg-slate-800 dark:bg-blue-500 text-white shadow-md font-bold" 
+                  : "text-slate-400 dark:text-slate-500 hover:text-slate-600 dark:hover:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800/40"
               }`}
             >
               <Activity className="w-3.5 h-3.5" />
@@ -738,31 +939,31 @@ export default function App() {
           </div>
 
           {/* Stats Card */}
-          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-5 shadow-sm">
+          <div className="bg-white dark:bg-[#1a1b1e] border border-slate-200 dark:border-[#2d2e32] rounded-lg p-5 shadow-sm">
             <h2 className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-[0.15em] mb-5">System Overview</h2>
             <div className="space-y-5">
               <div className="flex justify-between items-end">
                 <div>
                   <p className="text-xs text-slate-500 dark:text-slate-400 mb-1">Inverted Index</p>
-                  <p className="text-2xl font-bold text-slate-800 dark:text-white tabular-nums">
+                  <p className="text-2xl font-bold text-slate-800 dark:text-slate-100 tabular-nums">
                     {stats?.terms.toLocaleString() || "0"}
                   </p>
                 </div>
                 <span className="text-[10px] text-slate-400 dark:text-slate-600 font-bold uppercase">Terms</span>
               </div>
-              <div className="flex justify-between items-end border-t border-slate-100 dark:border-slate-800 pt-5">
+              <div className="flex justify-between items-end border-t border-slate-100 dark:border-[#2d2e32] pt-5">
                 <div>
                   <p className="text-xs text-slate-500 dark:text-slate-400 mb-1">Documents Indexed</p>
-                  <p className="text-2xl font-bold text-slate-800 dark:text-white tabular-nums">
+                  <p className="text-2xl font-bold text-slate-800 dark:text-slate-100 tabular-nums">
                     {stats?.documents.toLocaleString() || "0"}
                   </p>
                 </div>
                 <span className="text-[10px] text-slate-400 dark:text-slate-600 font-bold uppercase">Files</span>
               </div>
-              <div className="flex justify-between items-end border-t border-slate-100 dark:border-slate-800 pt-5">
+              <div className="flex justify-between items-end border-t border-slate-100 dark:border-[#2d2e32] pt-5">
                 <div>
                   <p className="text-xs text-slate-500 dark:text-slate-400 mb-1">Visual Assets</p>
-                  <p className="text-2xl font-bold text-slate-800 dark:text-white tabular-nums">
+                  <p className="text-2xl font-bold text-slate-800 dark:text-slate-100 tabular-nums">
                     {stats?.images.toLocaleString() || "0"}
                   </p>
                 </div>
@@ -772,7 +973,7 @@ export default function App() {
           </div>
 
           {/* Ranking Model Selection (Mock UI for Polish) */}
-          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-5 shadow-sm">
+          <div className="bg-white dark:bg-[#1a1b1e] border border-slate-200 dark:border-[#2d2e32] rounded-lg p-5 shadow-sm">
             <h2 className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-[0.15em] mb-4">Ranking Model</h2>
             <div className="space-y-2">
               <label className="flex items-center space-x-3 p-2 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-900/40 rounded cursor-pointer group">
@@ -781,16 +982,23 @@ export default function App() {
                 </div>
                 <span className="text-sm font-semibold text-blue-900 dark:text-blue-100">BM25 (Default)</span>
               </label>
-              <label className="flex items-center space-x-3 p-2 hover:bg-slate-50 dark:hover:bg-slate-800 border border-transparent rounded cursor-pointer opacity-40 transition-all">
-                <div className="w-4 h-4 rounded-full border-2 border-slate-300 dark:border-slate-700" />
+              <label className="flex items-center space-x-3 p-2 hover:bg-slate-50 dark:hover:bg-[#2d2e32] border border-transparent rounded cursor-pointer opacity-40 transition-all">
+                <div className="w-4 h-4 rounded-full border-2 border-slate-300 dark:border-[#3c4043]" />
                 <span className="text-sm font-medium text-slate-600 dark:text-slate-400">TF-IDF</span>
               </label>
             </div>
-            <div className="mt-4 pt-4 border-t border-slate-100 dark:border-slate-800">
+            <div className="mt-4 pt-4 border-t border-slate-100 dark:border-[#2d2e32]">
               <p className="text-[10px] text-slate-400 dark:text-slate-500 leading-relaxed font-medium">
                 Current params: <span className="text-slate-600 dark:text-slate-300">k1=1.2, b=0.75</span>. Query normalization active.
               </p>
             </div>
+            <button 
+              onClick={handleClearCache}
+              className="w-full mt-4 flex items-center justify-center gap-2 py-2 border border-red-200 dark:border-red-900/30 text-red-600 dark:text-red-400 rounded hover:bg-red-50 dark:hover:bg-red-950/20 text-[10px] font-bold uppercase tracking-widest transition-all"
+            >
+              <Trash2 className="w-3 h-3" />
+              Clear Search Index
+            </button>
           </div>
 
             {/* Mock Console Logs for Polish */}
@@ -800,8 +1008,11 @@ export default function App() {
                 <Activity className="w-3 h-3 text-emerald-500" />
               </div>
               <div className="space-y-2 space-y-reverse flex flex-col-reverse flex-1 overflow-y-auto scrollbar-none">
+                {stats?.status && stats.status !== "Idle" && (
+                   <p className="text-emerald-400 font-bold animate-pulse"><span className="text-emerald-500">[LOG]</span> {stats.status}</p>
+                )}
                 {isCrawling && (
-                  <p className="animate-pulse"><span className="text-emerald-500">[WRN]</span> Crawl worker active...</p>
+                  <p className="animate-pulse"><span className="text-emerald-500">[WRN]</span> User initiated crawl sequence...</p>
                 )}
                 {isSearching && (
                    <p><span className="text-blue-400">[QRY]</span> Executing ranking pipeline...</p>
@@ -826,20 +1037,20 @@ export default function App() {
                 className="flex flex-col items-center w-full max-w-2xl px-6"
               >
                 <div className="mb-8">
-                  <GoogleLogo size="text-7xl md:text-8xl" />
+                  <WeblooLogo size="text-8xl md:text-9xl" />
                 </div>
                 
                 <form onSubmit={handleSearch} className="w-full relative group">
                   <div className="relative">
                     <div className="absolute inset-y-0 left-5 flex items-center pointer-events-none">
-                      <Search className="w-5 h-5 text-slate-400" />
+                      <Search className="w-5 h-5 text-slate-400 group-focus-within:text-blue-500 dark:group-focus-within:text-[#8ab4f8]" />
                     </div>
                     <input 
                       type="text"
                       value={query}
                       onChange={handleQueryChange}
                       onFocus={() => setShowSuggestions(true)}
-                      className="w-full pl-14 pr-24 py-4 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-full shadow-sm hover:shadow-md transition-all focus:outline-none focus:ring-1 focus:ring-blue-500/20 focus:border-blue-400 text-lg dark:text-white"
+                      className="w-full pl-14 pr-24 py-4 bg-white dark:bg-[#1a1b1e] border border-slate-200 dark:border-[#2d2e32] rounded-full shadow-sm hover:shadow-md transition-all focus:outline-none focus:ring-1 focus:ring-blue-500/20 focus:border-blue-400 text-lg dark:text-white"
                       placeholder="Search the index or type a query..."
                     />
                     <div className="absolute inset-y-0 right-4 flex items-center gap-3">
@@ -884,9 +1095,9 @@ export default function App() {
                 <div className="flex items-center gap-3 mt-8">
                   <button 
                     onClick={handleSearch}
-                    className="px-6 py-2 bg-slate-50 dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-sm font-medium text-slate-600 dark:text-slate-300 rounded border border-transparent hover:border-slate-200 dark:hover:border-slate-600 transition-all shadow-sm"
+                    className="px-6 py-2 bg-[#f8f9fa] dark:bg-[#303134] hover:bg-slate-100 dark:hover:bg-[#3c4043] text-sm font-medium text-slate-600 dark:text-slate-300 rounded border border-transparent hover:border-slate-200 dark:hover:border-[#3c4043] transition-all shadow-sm"
                   >
-                    MiniSearch Engine
+                    Webloo Search
                   </button>
                   <button 
                     onClick={() => {
@@ -894,14 +1105,14 @@ export default function App() {
                       setQuery(lucky);
                       handleSearch(undefined, 1, lucky);
                     }}
-                    className="px-6 py-2 bg-slate-50 dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-sm font-medium text-slate-600 dark:text-slate-300 rounded border border-transparent hover:border-slate-200 dark:hover:border-slate-600 transition-all shadow-sm"
+                    className="px-6 py-2 bg-[#f8f9fa] dark:bg-[#303134] hover:bg-slate-100 dark:hover:bg-[#3c4043] text-sm font-medium text-slate-600 dark:text-slate-300 rounded border border-transparent hover:border-slate-200 dark:hover:border-[#3c4043] transition-all shadow-sm"
                   >
                     I'm Feeling Lucky
                   </button>
                 </div>
 
                 <div className="mt-12 flex flex-wrap justify-center gap-x-6 gap-y-2 text-xs text-slate-400 uppercase font-bold tracking-widest">
-                  <span className="text-slate-300 dark:text-slate-600">MiniSearch in:</span>
+                  <span className="text-slate-300 dark:text-slate-600">Webloo in:</span>
                   <a href="#" className="text-blue-600 hover:underline">English</a>
                   <a href="#" className="text-blue-600 hover:underline">Developer Mode</a>
                   <a href="#" className="text-blue-600 hover:underline">Admin Panel</a>
@@ -920,11 +1131,11 @@ export default function App() {
                       exit={{ height: 0, opacity: 0 }}
                       className="overflow-hidden"
                     >
-                      <div className="bg-white dark:bg-slate-900 border border-blue-200 dark:border-blue-900/30 rounded-lg p-6 shadow-md mb-2">
+                      <div className="bg-white dark:bg-[#303134] border border-blue-200 dark:border-blue-900/30 rounded-lg p-6 shadow-md mb-2">
                         <header className="flex justify-between items-center mb-4">
                           <h3 className="font-bold text-slate-800 dark:text-slate-100 flex items-center gap-2">
-                            <Globe className="w-4 h-4 text-blue-600 dark:text-blue-400" />
-                            Add Documents to Index
+                            <Globe className="w-4 h-4 text-blue-600 dark:text-[#8ab4f8]" />
+                            Add Documents to Webloo
                           </h3>
                         </header>
                         <form onSubmit={handleCrawl} className="flex flex-col gap-4">
@@ -932,13 +1143,13 @@ export default function App() {
                             <div className="flex-1 space-y-1.5">
                               <label className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest px-1">Entry Point URL</label>
                               <input
-                                type="url"
+                                type="text"
                                 value={crawlUrl}
                                 onChange={(e) => setCrawlUrl(e.target.value)}
                                 placeholder="https://example.com/docs"
-                                required
-                                className="w-full px-4 py-2 bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all dark:text-slate-200"
+                                className={`w-full px-4 py-2 bg-slate-50 dark:bg-[#202124] border ${crawlError ? 'border-red-500' : 'border-slate-200 dark:border-[#3c4043]'} rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all dark:text-slate-200`}
                               />
+                              {crawlError && <p className="text-[10px] text-red-500 font-bold px-1">{crawlError}</p>}
                             </div>
                             <div className="w-24 space-y-1.5">
                               <label className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest px-1">Depth</label>
@@ -948,14 +1159,14 @@ export default function App() {
                                 max="3"
                                 value={crawlDepth}
                                 onChange={(e) => setCrawlDepth(parseInt(e.target.value) || 1)}
-                                className="w-full px-4 py-2 bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all dark:text-slate-200"
+                                className="w-full px-4 py-2 bg-slate-50 dark:bg-[#202124] border border-slate-200 dark:border-[#3c4043] rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all dark:text-slate-200"
                               />
                             </div>
                           </div>
                           <div className="flex justify-end">
                             <button 
                               type="submit"
-                              disabled={isSearching || isCrawling}
+                              disabled={isSearching || isCrawling || !crawlUrl}
                               className="bg-blue-600 text-white px-8 py-2.5 rounded-lg text-sm font-bold hover:bg-blue-700 transition-all shadow-sm hover:shadow-md disabled:opacity-50 flex items-center gap-2 active:scale-95"
                             >
                               {isCrawling ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
@@ -970,8 +1181,8 @@ export default function App() {
               )}
 
               {/* Search Card */}
-              <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-4 shadow-sm space-y-4">
-                <div className="flex items-center space-x-2 border-b border-slate-100 dark:border-slate-800 pb-2 mb-2">
+              <div className="bg-white dark:bg-[#202124] border border-slate-200 dark:border-[#3c4043] rounded-lg p-4 shadow-sm space-y-4">
+                <div className="flex items-center space-x-2 border-b border-slate-100 dark:border-[#3c4043] pb-2 mb-2">
                   <button 
                     onClick={() => setSearchType("text")}
                     className={`px-3 py-1 text-[10px] font-bold uppercase tracking-widest rounded transition-all ${searchType === "text" ? "bg-slate-800 dark:bg-blue-600 text-white shadow-sm" : "text-slate-400 dark:text-slate-500 hover:text-slate-600 dark:hover:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800"}`}
@@ -998,7 +1209,7 @@ export default function App() {
                         onChange={handleQueryChange}
                         onFocus={() => (query.length >= 2 || searchHistory.length > 0) && setShowSuggestions(true)}
                         placeholder={searchType === "text" ? "Search the document index..." : "Search for images or analyze one..."}
-                        className="w-full pl-12 pr-12 py-3.5 bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-lg text-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all placeholder:text-slate-400 dark:placeholder:text-slate-600 dark:text-white"
+                        className="w-full pl-12 pr-12 py-3.5 bg-slate-50 dark:bg-[#303134] border border-slate-200 dark:border-[#3c4043] rounded-lg text-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all placeholder:text-slate-400 dark:placeholder:text-slate-600 dark:text-white"
                       />
                       <div className="absolute inset-y-0 right-3 flex items-center gap-2">
                         <button 
@@ -1101,8 +1312,8 @@ export default function App() {
                       {showAdvanced ? "Hide Advanced Options" : "Advanced Search Options"}
                       <ChevronRight className={`w-3 h-3 transition-transform ${showAdvanced ? "rotate-90" : ""}`} />
                     </button>
-                    {(mustWords || notWords || phrase) && !showAdvanced && (
-                       <span className="text-[10px] text-emerald-600 font-bold uppercase tracking-widest bg-emerald-50 px-2 py-0.5 rounded border border-emerald-100">
+                    {(mustWords || notWords || phrase || startDate || endDate || excludeDomains) && !showAdvanced && (
+                       <span className="text-[10px] text-emerald-600 font-bold uppercase tracking-widest bg-emerald-50 dark:bg-emerald-900/30 px-2 py-0.5 rounded border border-emerald-100 dark:border-emerald-900/40 transition-all">
                          Active Filters
                        </span>
                     )}
@@ -1116,36 +1327,97 @@ export default function App() {
                         exit={{ height: 0, opacity: 0 }}
                         className="overflow-hidden border-t border-slate-100 dark:border-slate-800 pt-4"
                       >
-                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                          <div className="space-y-1.5">
-                            <label className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest">All these words (AND)</label>
-                            <input 
-                              type="text" 
-                              value={mustWords}
-                              onChange={(e) => setMustWords(e.target.value)}
-                              placeholder="word1 word2..."
-                              className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md text-sm focus:outline-none focus:ring-1 focus:ring-blue-500 dark:text-white"
-                            />
+                        <div className="space-y-6">
+                          {/* Core Constraints */}
+                          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <div className="space-y-1.5">
+                              <label className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest px-1">Must include terms</label>
+                              <input 
+                                type="text" 
+                                value={mustWords}
+                                onChange={(e) => setMustWords(e.target.value)}
+                                placeholder="word1 word2..."
+                                className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md text-sm focus:outline-none focus:ring-1 focus:ring-blue-500 dark:text-white"
+                              />
+                            </div>
+                            <div className="space-y-1.5">
+                              <label className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest px-1">Exact phrase match</label>
+                              <input 
+                                type="text" 
+                                value={phrase}
+                                onChange={(e) => setPhrase(e.target.value)}
+                                placeholder="the specific phrase"
+                                className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md text-sm focus:outline-none focus:ring-1 focus:ring-blue-500 dark:text-white"
+                              />
+                            </div>
+                            <div className="space-y-1.5">
+                              <label className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest px-1">Exclude terms</label>
+                              <input 
+                                type="text" 
+                                value={notWords}
+                                onChange={(e) => setNotWords(e.target.value)}
+                                placeholder="exclude these"
+                                className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md text-sm focus:outline-none focus:ring-1 focus:ring-blue-500 dark:text-white"
+                              />
+                            </div>
                           </div>
-                          <div className="space-y-1.5">
-                            <label className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest">Exact phrase</label>
-                            <input 
-                              type="text" 
-                              value={phrase}
-                              onChange={(e) => setPhrase(e.target.value)}
-                              placeholder="the specific phrase"
-                              className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md text-sm focus:outline-none focus:ring-1 focus:ring-blue-500 dark:text-white"
-                            />
+
+                          {/* Temporal & Spatial Constraints */}
+                          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 border-t border-slate-100 dark:border-slate-800 pt-4">
+                            <div className="space-y-1.5">
+                              <label className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest px-1 flex items-center gap-1.5">
+                                <Clock className="w-3 h-3" />
+                                From Date
+                              </label>
+                              <input 
+                                type="date" 
+                                value={startDate}
+                                onChange={(e) => setStartDate(e.target.value)}
+                                className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md text-sm focus:outline-none focus:ring-1 focus:ring-blue-500 dark:text-white [color-scheme:light] dark:[color-scheme:dark]"
+                              />
+                            </div>
+                            <div className="space-y-1.5">
+                              <label className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest px-1 flex items-center gap-1.5">
+                                <Clock className="w-3 h-3" />
+                                To Date
+                              </label>
+                              <input 
+                                type="date" 
+                                value={endDate}
+                                onChange={(e) => setEndDate(e.target.value)}
+                                className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md text-sm focus:outline-none focus:ring-1 focus:ring-blue-500 dark:text-white [color-scheme:light] dark:[color-scheme:dark]"
+                              />
+                            </div>
+                            <div className="space-y-1.5">
+                              <label className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest px-1 flex items-center gap-1.5">
+                                <X className="w-3 h-3" />
+                                Exclude Domains
+                              </label>
+                              <input 
+                                type="text" 
+                                value={excludeDomains}
+                                onChange={(e) => setExcludeDomains(e.target.value)}
+                                placeholder="wikipedia.org github.com"
+                                className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md text-sm focus:outline-none focus:ring-1 focus:ring-blue-500 dark:text-white"
+                              />
+                            </div>
                           </div>
-                          <div className="space-y-1.5">
-                            <label className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest">None of these words (NOT)</label>
-                            <input 
-                              type="text" 
-                              value={notWords}
-                              onChange={(e) => setNotWords(e.target.value)}
-                              placeholder="exclude these"
-                              className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md text-sm focus:outline-none focus:ring-1 focus:ring-blue-500 dark:text-white"
-                            />
+
+                          <div className="flex justify-end pt-2">
+                             <button 
+                                type="button" 
+                                onClick={() => {
+                                  setMustWords("");
+                                  setNotWords("");
+                                  setPhrase("");
+                                  setStartDate("");
+                                  setEndDate("");
+                                  setExcludeDomains("");
+                                }}
+                                className="text-[10px] font-bold text-slate-400 hover:text-red-500 uppercase tracking-widest transition-colors"
+                             >
+                               Reset All Filters
+                             </button>
                           </div>
                         </div>
                       </motion.div>
@@ -1190,25 +1462,31 @@ export default function App() {
                 <div className="space-y-4 pb-12">
                   <AnimatePresence initial={false}>
                     {searchType === "text" ? results.map((result, idx) => (
-                      <motion.div 
-                        key={`${result.url}-${idx}-${query}`}
-                        initial={{ opacity: 0, y: 10 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        transition={{ delay: idx * 0.03 }}
-                        className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-6 hover:border-blue-300 dark:hover:border-blue-800 hover:shadow-md transition-all cursor-pointer group"
-                        onClick={() => window.open(result.url, '_blank')}
-                      >
-                        <div className="flex justify-between items-start mb-2">
-                          <div className="flex-1 pr-4">
-                            <h3 className="text-lg font-bold text-blue-700 dark:text-blue-400 group-hover:text-blue-800 dark:group-hover:text-blue-300 group-hover:underline transition-colors leading-tight">
-                              {result.title}
-                            </h3>
-                            <p className="text-[11px] text-emerald-600 dark:text-emerald-500 font-semibold truncate mt-1">
-                              {result.url}
-                            </p>
-                          </div>
+                          <motion.div 
+                            key={`${result.url}-${idx}-${query}`}
+                            initial={{ opacity: 0, y: 10 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            whileHover={{ 
+                              scale: 1.015, 
+                              y: -4,
+                              boxShadow: "0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1)",
+                              transition: { duration: 0.2 }
+                            }}
+                            transition={{ delay: idx * 0.03 }}
+                            className="bg-white dark:bg-[#303134] border border-slate-200 dark:border-[#3c4043] rounded-lg p-6 group cursor-pointer transition-all hover:bg-white dark:hover:bg-[#3c4043]/50 hover:shadow-2xl dark:hover:shadow-black/60 active:scale-[0.99]"
+                            onClick={() => window.open(result.url, '_blank')}
+                          >
+                            <div className="flex justify-between items-start mb-2">
+                              <div className="flex-1 pr-4">
+                                <h3 className="text-lg font-medium text-blue-700 dark:text-[#8ab4f8] group-hover:underline transition-colors leading-tight">
+                                  {highlightText(result.title, getCombinedQueryTokens())}
+                                </h3>
+                                <p className="text-[11px] text-emerald-700 dark:text-emerald-400 font-medium truncate mt-1">
+                                  {result.url}
+                                </p>
+                              </div>
                           <div className="flex flex-col items-end gap-1">
-                            <div className="bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400 text-[10px] font-bold px-3 py-1.5 rounded-full border border-blue-100 dark:border-blue-900/40 uppercase tracking-wider shrink-0 shadow-sm">
+                            <div className="bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-[#8ab4f8] text-[10px] font-bold px-3 py-1.5 rounded-full border border-blue-100 dark:border-blue-900/40 uppercase tracking-wider shrink-0 shadow-sm">
                               BM25: {result.score.toFixed(2)}
                             </div>
                             <span className="text-[9px] text-slate-400 dark:text-slate-500 font-bold uppercase tracking-tight">
@@ -1216,9 +1494,55 @@ export default function App() {
                             </span>
                           </div>
                         </div>
-                        <p className="text-sm text-slate-600 dark:text-slate-400 leading-relaxed line-clamp-2">
+                        <p className="text-sm text-slate-600 dark:text-[#bdc1c6] leading-relaxed line-clamp-2">
                           {highlightText(result.snippet, getCombinedQueryTokens())}
                         </p>
+                        
+                        {/* Feedback Mechanism */}
+                        <div className="mt-4 pt-3 border-t border-slate-100 dark:border-[#3c4043] flex items-center justify-between">
+                          <div className="flex items-center gap-1">
+                            <span className="text-[9px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-tighter mr-2">Is this relevant?</span>
+                            <div className="flex items-center gap-2">
+                              <button 
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleFeedback(result.url, true);
+                                }}
+                                disabled={feedbackSubmitted[`${query}-${result.url}`]}
+                                className={`p-1.5 rounded transition-all flex items-center gap-1.5 ${
+                                  feedbackSubmitted[`${query}-${result.url}`] === true 
+                                    ? "bg-emerald-50 dark:bg-emerald-900/40 text-emerald-600 dark:text-emerald-400 border border-emerald-100 dark:border-emerald-900/30" 
+                                    : "text-slate-400 dark:text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800 hover:text-emerald-500"
+                                }`}
+                                title="Relevent"
+                                id={`thumbs-up-${idx}`}
+                              >
+                                <ThumbsUp className="w-3 h-3" />
+                                {feedbackSubmitted[`${query}-${result.url}`] === true && <span className="text-[10px] font-bold">Yes</span>}
+                              </button>
+                              <button 
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleFeedback(result.url, false);
+                                }}
+                                disabled={feedbackSubmitted[`${query}-${result.url}`]}
+                                className={`p-1.5 rounded transition-all flex items-center gap-1.5 ${
+                                  feedbackSubmitted[`${query}-${result.url}`] === false 
+                                    ? "bg-red-50 dark:bg-red-950/40 text-red-600 dark:text-red-400 border border-red-100 dark:border-red-900/30" 
+                                    : "text-slate-400 dark:text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800 hover:text-red-500"
+                                }`}
+                                title="Not Relevant"
+                                id={`thumbs-down-${idx}`}
+                              >
+                                <ThumbsDown className="w-3 h-3" />
+                                {feedbackSubmitted[`${query}-${result.url}`] === false && <span className="text-[10px] font-bold">No</span>}
+                              </button>
+                            </div>
+                          </div>
+                          {feedbackSubmitted[`${query}-${result.url}`] !== undefined && (
+                            <span className="text-[9px] font-bold text-slate-400 dark:text-slate-500 uppercase italic">Feedback sent</span>
+                          )}
+                        </div>
                       </motion.div>
                     )) : (
                       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
@@ -1227,11 +1551,16 @@ export default function App() {
                             key={`${img.url}-${idx}`}
                             initial={{ opacity: 0, scale: 0.9 }}
                             animate={{ opacity: 1, scale: 1 }}
-                            whileHover={{ y: -5, transition: { duration: 0.2 } }}
+                            whileHover={{ 
+                              y: -8, 
+                              scale: 1.03,
+                              boxShadow: "0 25px 50px -12px rgb(0 0 0 / 0.15)",
+                              transition: { duration: 0.2 } 
+                            }}
                             transition={{ delay: idx * 0.05 }}
-                            className="bg-white border border-slate-200 rounded-lg overflow-hidden shadow-sm hover:shadow-xl transition-all cursor-pointer group flex flex-col relative"
+                            className="bg-white dark:bg-[#303134] border border-slate-200 dark:border-[#3c4043] rounded-lg overflow-hidden shadow-sm hover:shadow-2xl transition-all cursor-pointer group flex flex-col relative active:scale-[0.98]"
                           >
-                            <div className="aspect-square bg-slate-100 dark:bg-slate-800 overflow-hidden relative" onClick={() => setViewImage(img)}>
+                            <div className="aspect-square bg-slate-100 dark:bg-[#202124] overflow-hidden relative" onClick={() => setViewImage(img)}>
                               <img 
                                 src={img.url} 
                                 alt={img.alt} 
@@ -1245,18 +1574,18 @@ export default function App() {
                                 <Activity className="w-8 h-8 text-white animate-pulse" />
                               </div>
                             </div>
-                            <div className="p-3 space-y-1 group-hover:bg-blue-50/50 dark:group-hover:bg-blue-900/20 transition-colors flex-1 flex flex-col justify-between">
+                            <div className="p-3 space-y-1 group-hover:bg-blue-50/50 dark:group-hover:bg-[#3c4043]/40 transition-colors flex-1 flex flex-col justify-between">
                               <div onClick={() => setViewImage(img)}>
                                 <p className="text-xs font-bold text-slate-800 dark:text-slate-200 line-clamp-2 leading-tight mb-1">{img.alt || "Visual Result"}</p>
-                                <p className="text-[9px] text-slate-500 dark:text-slate-500 line-clamp-1 flex items-center gap-1 uppercase tracking-tight">
+                                <p className="text-[9px] text-slate-500 dark:text-slate-400 line-clamp-1 flex items-center gap-1 uppercase tracking-tight">
                                   <Globe className="w-2.5 h-2.5" />
                                   {new URL(img.parentUrl).hostname}
                                 </p>
                               </div>
-                              <div className="mt-3 pt-3 border-t border-slate-100 dark:border-slate-800 flex flex-col gap-2">
+                              <div className="mt-3 pt-3 border-t border-slate-100 dark:border-[#4c5054] flex flex-col gap-2">
                                 <div className="flex justify-between items-center text-[9px] font-bold uppercase text-slate-400">
                                   <span>Similarity</span>
-                                  <span className="text-blue-600 dark:text-blue-400">{(img.score * 10).toFixed(0)}%</span>
+                                  <span className="text-[#1a73e8] dark:text-[#8ab4f8]">{(img.score * 10).toFixed(0)}%</span>
                                 </div>
                                 <button 
                                   onClick={(e) => {
@@ -1264,11 +1593,45 @@ export default function App() {
                                     handleMoreLikeThis(img);
                                   }}
                                   disabled={isAnalyzing}
-                                  className="w-full py-1.5 border border-blue-200 dark:border-blue-800 rounded text-[9px] font-bold uppercase text-blue-600 dark:text-blue-400 hover:bg-blue-600 dark:hover:bg-blue-600 hover:text-white dark:hover:text-white transition-all flex items-center justify-center gap-1.5 disabled:opacity-50"
+                                  className="w-full py-1.5 border border-blue-200 dark:border-[#8ab4f8]/30 rounded text-[9px] font-bold uppercase text-blue-600 dark:text-[#8ab4f8] hover:bg-blue-600 dark:hover:bg-[#8ab4f8] hover:text-white dark:hover:text-[#202124] transition-all flex items-center justify-center gap-1.5 disabled:opacity-50"
                                 >
                                   {isAnalyzing ? <Loader2 className="w-3 h-3 animate-spin" /> : <Activity className="w-3 h-3" />}
                                   {isAnalyzing ? "Analyzing..." : "More like this"}
                                 </button>
+                                
+                                <div className="flex items-center justify-between pt-1">
+                                   <span className="text-[8px] font-bold text-slate-400 dark:text-slate-500 uppercase">Relevant?</span>
+                                   <div className="flex items-center gap-1">
+                                      <button 
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          handleFeedback(img.url, true);
+                                        }}
+                                        disabled={feedbackSubmitted[`${query}-${img.url}`]}
+                                        className={`p-1 rounded transition-all ${
+                                          feedbackSubmitted[`${query}-${img.url}`] === true 
+                                            ? "bg-emerald-50 dark:bg-emerald-900/40 text-emerald-600 dark:text-emerald-400" 
+                                            : "text-slate-400 dark:text-slate-500 hover:bg-emerald-50 dark:hover:bg-emerald-950/20 hover:text-emerald-500"
+                                        }`}
+                                      >
+                                        <ThumbsUp className="w-2.5 h-2.5" />
+                                      </button>
+                                      <button 
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          handleFeedback(img.url, false);
+                                        }}
+                                        disabled={feedbackSubmitted[`${query}-${img.url}`]}
+                                        className={`p-1 rounded transition-all ${
+                                          feedbackSubmitted[`${query}-${img.url}`] === false 
+                                            ? "bg-red-50 dark:bg-red-950/40 text-red-600 dark:text-red-400" 
+                                            : "text-slate-400 dark:text-slate-500 hover:bg-red-50 dark:hover:bg-red-950/20 hover:text-red-500"
+                                        }`}
+                                      >
+                                        <ThumbsDown className="w-2.5 h-2.5" />
+                                      </button>
+                                   </div>
+                                </div>
                               </div>
                             </div>
                           </motion.div>
@@ -1378,22 +1741,102 @@ export default function App() {
               animate={{ opacity: 1, scale: 1 }}
               className="flex-1 overflow-y-auto space-y-6 pr-2 custom-scrollbar"
             >
+              <div className="flex items-center justify-between bg-slate-900 dark:bg-black p-6 rounded-xl border border-slate-800 shadow-2xl overflow-hidden relative group">
+                <div className="absolute inset-0 bg-gradient-to-r from-blue-600/10 to-transparent pointer-events-none" />
+                <div className="relative z-10">
+                   <h2 className="text-xl font-bold text-white mb-1">Index Activity Monitor</h2>
+                   <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Real-time status feed from engine cluster</p>
+                </div>
+                <div className="relative z-10 flex items-center gap-6">
+                   <div className="text-right">
+                      <p className="text-[9px] font-bold text-slate-500 uppercase tracking-widest mb-1">Current State</p>
+                      <div className="flex items-center gap-3 justify-end">
+                         <span className={`text-base font-bold tracking-tight ${stats?.status === "Idle" ? "text-slate-400" : "text-emerald-400"}`}>
+                           {stats?.status || "Initializing"}
+                         </span>
+                         <div className={`w-3 h-3 rounded-full shadow-lg ${stats?.status === "Idle" ? "bg-slate-700" : "bg-emerald-500 animate-pulse shadow-emerald-500/50"}`} />
+                      </div>
+                   </div>
+                </div>
+                {stats?.status !== "Idle" && (
+                  <motion.div 
+                    initial={{ width: 0 }}
+                    animate={{ width: "100%" }}
+                    transition={{ duration: 2, repeat: Infinity }}
+                    className="absolute bottom-0 left-0 h-0.5 bg-emerald-500/30"
+                  />
+                )}
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                {[
+                  { label: "Vocabulary Size", value: stats?.terms, unit: "unique stems" },
+                  { label: "Indexed Pages", value: stats?.documents, unit: "HTML documents" },
+                  { label: "Visual Assets", value: stats?.images, unit: "image candidates" },
+                  { label: "Avg. Precision", value: stats?.feedback ? ((stats.feedback.relevant / (stats.feedback.total || 1)) * 100).toFixed(0) : "0", unit: "% positive feedback" }
+                ].map((stat, i) => (
+                  <div key={i} className="bg-white dark:bg-slate-900 border border-slate-100 dark:border-slate-800 p-4 rounded-lg shadow-sm">
+                    <p className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-1">{stat.label}</p>
+                    <p className="text-2xl font-bold text-slate-800 dark:text-white">{stat.value}</p>
+                    <p className="text-[9px] text-slate-400 font-medium uppercase mt-1">{stat.unit}</p>
+                  </div>
+                ))}
+              </div>
+
+              {stats?.feedback && (
+                <div className="bg-white dark:bg-[#303134] border border-slate-200 dark:border-[#3c4043] rounded-lg p-6 shadow-sm">
+                  <h3 className="text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-6 flex items-center gap-2">
+                    <Activity className="w-3.5 h-3.5" />
+                    Relevance Feedback Overview
+                  </h3>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                    <div className="flex flex-col items-center justify-center p-4 border border-slate-50 dark:border-slate-800 rounded-lg">
+                      <p className="text-3xl font-bold text-slate-800 dark:text-white">{stats.feedback.total}</p>
+                      <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-2">Total Submissions</p>
+                    </div>
+                    <div className="flex flex-col items-center justify-center p-4 border border-emerald-50 dark:border-emerald-900/20 bg-emerald-50/30 dark:bg-emerald-900/5 rounded-lg">
+                      <div className="flex items-center gap-2 mb-1">
+                        <ThumbsUp className="w-4 h-4 text-emerald-500" />
+                        <p className="text-3xl font-bold text-emerald-600 dark:text-emerald-400">{stats.feedback.relevant}</p>
+                      </div>
+                      <p className="text-[10px] font-bold text-emerald-500/80 uppercase tracking-widest">Relevant Results</p>
+                      <p className="text-[9px] text-emerald-400 mt-1 font-bold">
+                        {((stats.feedback.relevant / (stats.feedback.total || 1)) * 100).toFixed(1)}% SUCCESS RATE
+                      </p>
+                    </div>
+                    <div className="flex flex-col items-center justify-center p-4 border border-red-50 dark:border-red-900/20 bg-red-50/30 dark:bg-red-900/5 rounded-lg">
+                      <div className="flex items-center gap-2 mb-1">
+                        <ThumbsDown className="w-4 h-4 text-red-500" />
+                        <p className="text-3xl font-bold text-red-600 dark:text-red-400">{stats.feedback.notRelevant}</p>
+                      </div>
+                      <p className="text-[10px] font-bold text-red-500/80 uppercase tracking-widest">Missed Expectations</p>
+                      <p className="text-[9px] text-red-400 mt-1 font-bold">
+                        {((stats.feedback.notRelevant / (stats.feedback.total || 1)) * 100).toFixed(1)}% FAILURE RATE
+                      </p>
+                    </div>
+                  </div>
+                  <p className="text-[10px] text-slate-400 dark:text-slate-500 mt-6 leading-relaxed italic text-center">
+                    Collect more feedback from users to identify patterns and refine the BM25 k1 and b parameters.
+                  </p>
+                </div>
+              )}
+
               <div className="grid grid-cols-2 gap-6">
                 <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-6 shadow-sm">
                   <h3 className="text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-6">Inverted Index Density (Top 10 Terms)</h3>
                   <div className="h-[300px]">
                     <ResponsiveContainer width="100%" height="100%">
                       <BarChart data={stats?.topTerms || []}>
-                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke={darkMode ? "#1e293b" : "#f1f5f9"} />
-                        <XAxis dataKey="term" fontSize={10} axisLine={false} tickLine={false} tick={{fill: darkMode ? '#64748b' : '#94a3b8'}} />
+                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke={darkMode ? "#3c4043" : "#f1f5f9"} />
+                        <XAxis dataKey="term" fontSize={10} axisLine={false} tickLine={false} tick={{fill: darkMode ? '#9aa0a6' : '#94a3b8'}} />
                         <YAxis hide />
                         <Tooltip 
-                          contentStyle={{backgroundColor: darkMode ? '#0f172a' : '#ffffff', borderRadius: '8px', border: `1px solid ${darkMode ? '#1e293b' : '#e2e8f0'}`, boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}}
-                          itemStyle={{fontSize: '12px', fontWeight: 'bold', color: darkMode ? '#f1f5f9' : '#0f172a'}}
+                          contentStyle={{backgroundColor: darkMode ? '#303134' : '#ffffff', borderRadius: '8px', border: `1px solid ${darkMode ? '#3c4043' : '#e2e8f0'}`, boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'}}
+                          itemStyle={{fontSize: '12px', fontWeight: 'bold', color: darkMode ? '#e8eaed' : '#0f172a'}}
                         />
                         <Bar 
                           dataKey="count" 
-                          fill={darkMode ? "#3b82f6" : "#2563eb"} 
+                          fill={darkMode ? "#8ab4f8" : "#2563eb"} 
                           radius={[4, 4, 0, 0]} 
                           barSize={30} 
                           className="cursor-pointer hover:opacity-80 transition-opacity"
@@ -1424,31 +1867,24 @@ export default function App() {
                           dataKey="value"
                         >
                           {(stats?.domainDist || []).map((_, index) => (
-                            <Cell key={`cell-${index}`} fill={darkMode ? ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6'][index % 5] : ['#2563eb', '#059669', '#d97706', '#dc2626', '#7c3aed'][index % 5]} />
+                            <Cell key={`cell-${index}`} fill={darkMode ? ['#8ab4f8', '#81c995', '#fde293', '#f28b82', '#d7aefb'][index % 5] : ['#1a73e8', '#34a853', '#fbbc04', '#ea4335', '#a142f4'][index % 5]} />
                           ))}
                         </Pie>
-                        <Tooltip contentStyle={{backgroundColor: darkMode ? '#0f172a' : '#ffffff', border: `1px solid ${darkMode ? '#1e293b' : '#e2e8f0'}`}} />
+                        <Tooltip contentStyle={{backgroundColor: darkMode ? '#303134' : '#ffffff', border: `1px solid ${darkMode ? '#3c4043' : '#e2e8f0'}`, borderRadius: '8px'}} />
                       </PieChart>
                     </ResponsiveContainer>
                   </div>
                 </div>
               </div>
 
-              <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-6 shadow-sm">
-                <h3 className="text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-4">Index Health Metrics</h3>
-                <div className="grid grid-cols-3 gap-4">
-                  {[
-                    { label: "Vocabulary Size", value: stats?.terms, unit: "unique stems" },
-                    { label: "Document Volume", value: stats?.documents, unit: "indexed files" },
-                    { label: "Avg Doc Length", value: "248.4", unit: "tokens" }
-                  ].map((item, i) => (
-                    <div key={i} className="p-4 bg-slate-50 dark:bg-slate-800/50 rounded-lg border border-slate-100 dark:border-slate-800">
-                      <p className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase mb-1">{item.label}</p>
-                      <p className="text-xl font-bold text-slate-800 dark:text-white">{item.value?.toLocaleString()}</p>
-                      <p className="text-[10px] text-slate-400 dark:text-slate-500 mt-1">{item.unit}</p>
-                    </div>
-                  ))}
-                </div>
+              <div className="flex justify-end">
+                <button 
+                  onClick={handleClearCache}
+                  className="flex items-center gap-2 px-4 py-2 border border-red-200 dark:border-red-900/30 text-red-600 dark:text-red-400 rounded-lg hover:bg-red-50 dark:hover:bg-red-950/20 text-[10px] font-bold uppercase tracking-widest transition-all shadow-sm"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  Reset Entire Search Index
+                </button>
               </div>
             </motion.div>
           ) : view === "admins" ? (
@@ -1473,13 +1909,13 @@ export default function App() {
 
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
                 {/* Administrators List */}
-                <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg shadow-sm flex flex-col overflow-hidden">
-                  <div className="p-4 border-b border-slate-100 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30 flex items-center justify-between">
+                <div className="bg-white dark:bg-[#303134] border border-slate-200 dark:border-[#3c4043] rounded-lg shadow-sm flex flex-col overflow-hidden">
+                  <div className="p-4 border-b border-slate-100 dark:border-[#4c5054] bg-slate-50/50 dark:bg-[#202124]/50 flex items-center justify-between">
                     <h3 className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest flex items-center gap-2">
                       <Shield className="w-3 h-3" />
                       Active Administrators
                     </h3>
-                    <span className="bg-blue-100 dark:bg-blue-900/40 text-blue-600 dark:text-blue-400 text-[10px] font-bold px-2 py-0.5 rounded-full">
+                    <span className="bg-blue-100 dark:bg-blue-900/40 text-blue-600 dark:text-[#8ab4f8] text-[10px] font-bold px-2 py-0.5 rounded-full">
                       {allAdmins.length}
                     </span>
                   </div>
@@ -1487,15 +1923,15 @@ export default function App() {
                     {allAdmins.length === 0 && !isLoadingAdmins ? (
                       <div className="p-12 text-center text-slate-400 italic text-sm">No administrators found.</div>
                     ) : (
-                      <div className="divide-y divide-slate-50 dark:divide-slate-800">
+                      <div className="divide-y divide-slate-50 dark:divide-[#3c4043]">
                         {allAdmins.map((admin) => (
-                          <div key={admin.uid} className="p-4 flex items-center justify-between hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors">
+                          <div key={admin.uid} className="p-4 flex items-center justify-between hover:bg-slate-50 dark:hover:bg-[#3c4043]/30 transition-colors">
                             <div className="flex items-center gap-3">
-                              <div className="w-8 h-8 rounded-full bg-blue-100 dark:bg-blue-900/50 flex items-center justify-center text-blue-600 dark:text-blue-400 text-xs font-bold">
+                              <div className="w-8 h-8 rounded-full bg-blue-100 dark:bg-blue-900/50 flex items-center justify-center text-blue-600 dark:text-[#8ab4f8] text-xs font-bold">
                                 {admin.displayName?.[0] || 'A'}
                               </div>
                               <div>
-                                <p className="text-sm font-bold text-slate-800 dark:text-slate-200">{admin.displayName || 'System Admin'}</p>
+                                <p className="text-sm font-bold text-slate-800 dark:text-slate-100">{admin.displayName || 'System Admin'}</p>
                                 <p className="text-[10px] text-slate-500 dark:text-slate-500 font-medium">{admin.email}</p>
                               </div>
                             </div>
@@ -1524,13 +1960,13 @@ export default function App() {
                 </div>
 
                 {/* System Users List */}
-                <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg shadow-sm flex flex-col overflow-hidden">
-                  <div className="p-4 border-b border-slate-100 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30 flex items-center justify-between">
+                <div className="bg-white dark:bg-[#303134] border border-slate-200 dark:border-[#3c4043] rounded-lg shadow-sm flex flex-col overflow-hidden">
+                  <div className="p-4 border-b border-slate-100 dark:border-[#4c5054] bg-slate-50/50 dark:bg-[#202124]/50 flex items-center justify-between">
                     <h3 className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest flex items-center gap-2">
                       <Users className="w-3 h-3" />
                       Recent System Users
                     </h3>
-                    <span className="bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 text-[10px] font-bold px-2 py-0.5 rounded-full">
+                    <span className="bg-slate-100 dark:bg-[#202124] text-slate-500 dark:text-slate-400 text-[10px] font-bold px-2 py-0.5 rounded-full">
                       {allUsers.length}
                     </span>
                   </div>
@@ -1538,22 +1974,22 @@ export default function App() {
                     {allUsers.length === 0 && !isLoadingAdmins ? (
                       <div className="p-12 text-center text-slate-400 italic text-sm">No users registered yet.</div>
                     ) : (
-                      <div className="divide-y divide-slate-50 dark:divide-slate-800">
+                      <div className="divide-y divide-slate-50 dark:divide-[#3c4043]">
                         {allUsers.map((u) => {
                           const isAd = allAdmins.some(a => a.uid === u.uid);
                           return (
-                            <div key={u.uid} className="p-4 flex items-center justify-between hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors">
+                            <div key={u.uid} className="p-4 flex items-center justify-between hover:bg-slate-50 dark:hover:bg-[#3c4043]/30 transition-colors">
                               <div className="flex items-center gap-3">
                                 {u.photoURL ? (
-                                  <img src={u.photoURL} alt="" className="w-8 h-8 rounded-full border border-slate-200 dark:border-slate-800" />
+                                  <img src={u.photoURL} alt="" className="w-8 h-8 rounded-full border border-slate-200 dark:border-[#3c4043]" />
                                 ) : (
-                                  <div className="w-8 h-8 rounded-full bg-slate-100 dark:bg-slate-800 flex items-center justify-center text-slate-400 text-xs font-bold">
+                                  <div className="w-8 h-8 rounded-full bg-slate-100 dark:bg-[#202124] flex items-center justify-center text-slate-400 text-xs font-bold">
                                     {u.displayName?.[0] || 'U'}
                                   </div>
                                 )}
                                 <div>
                                   <div className="flex items-center gap-2">
-                                    <p className="text-sm font-bold text-slate-800 dark:text-slate-200">{u.displayName || 'Guest'}</p>
+                                    <p className="text-sm font-bold text-slate-800 dark:text-slate-100">{u.displayName || 'Guest'}</p>
                                     {isAd && <Shield className="w-3 h-3 text-blue-500" />}
                                   </div>
                                   <p className="text-[10px] text-slate-500 dark:text-slate-500 font-medium">{u.email}</p>
@@ -1596,22 +2032,22 @@ export default function App() {
             >
               <div className="flex items-center justify-between">
                 <div>
-                  <h2 className="text-xl font-bold text-slate-900 dark:text-white">System Audit Log</h2>
+                  <h2 className="text-xl font-bold text-slate-900 dark:text-slate-100">System Audit Log</h2>
                   <p className="text-xs text-slate-500 dark:text-slate-400">Traceable record of all administrative actions performed on the system.</p>
                 </div>
                 <div className="flex items-center gap-3">
                   <button 
                     onClick={fetchAdminData}
                     disabled={isLoadingLogs}
-                    className="p-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors"
+                    className="p-2 bg-white dark:bg-[#303134] border border-slate-200 dark:border-[#3c4043] rounded-lg hover:bg-slate-50 dark:hover:bg-[#3c4043]/30 transition-colors"
                   >
                     <Activity className={`w-4 h-4 text-blue-600 ${isLoadingLogs ? 'animate-spin' : ''}`} />
                   </button>
                 </div>
               </div>
 
-              <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg shadow-sm overflow-hidden">
-                <div className="p-4 border-b border-slate-100 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30 flex items-center justify-between">
+              <div className="bg-white dark:bg-[#303134] border border-slate-200 dark:border-[#3c4043] rounded-lg shadow-sm overflow-hidden">
+                <div className="p-4 border-b border-slate-100 dark:border-[#4c5054] bg-slate-50/50 dark:bg-[#202124]/50 flex items-center justify-between">
                   <h3 className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest flex items-center gap-2">
                     <Clock className="w-3 h-3" />
                     Recent Actions (Last 50)
@@ -1619,7 +2055,7 @@ export default function App() {
                 </div>
                 <div className="overflow-x-auto">
                   <table className="w-full text-left border-collapse">
-                    <thead className="bg-slate-50 dark:bg-slate-800/50">
+                    <thead className="bg-slate-50 dark:bg-[#202124]/80">
                       <tr>
                         <th className="px-6 py-3 text-[9px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider">Timestamp</th>
                         <th className="px-6 py-3 text-[9px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider">Administrator</th>
@@ -1627,7 +2063,7 @@ export default function App() {
                         <th className="px-6 py-3 text-[9px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider">Details</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                    <tbody className="divide-y divide-slate-100 dark:divide-[#3c4043]">
                       {allLogs.length === 0 && !isLoadingLogs ? (
                         <tr>
                           <td colSpan={4} className="px-6 py-12 text-center text-slate-400 italic text-sm">No logs found.</td>
@@ -1663,6 +2099,125 @@ export default function App() {
                     </tbody>
                   </table>
                 </div>
+              </div>
+            </motion.div>
+          ) : view === "profile" ? (
+            <motion.div 
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="flex-1 overflow-y-auto space-y-6 pr-2 max-w-4xl mx-auto w-full custom-scrollbar py-8"
+            >
+              <div className="flex items-center gap-6 mb-8">
+                <div className="w-24 h-24 rounded-full bg-blue-100 dark:bg-blue-900 flex items-center justify-center border-4 border-white dark:border-slate-800 shadow-xl overflow-hidden shrink-0">
+                  {user?.photoURL ? (
+                    <img src={user.photoURL} alt="Profile" className="w-full h-full object-cover" />
+                  ) : (
+                    <Users className="w-10 h-10 text-blue-600 dark:text-blue-400" />
+                  )}
+                </div>
+                <div>
+                  <h2 className="text-3xl font-bold text-slate-900 dark:text-white mb-1">{user?.displayName || "Anonymous User"}</h2>
+                  <p className="text-slate-500 dark:text-slate-400 mb-2">{user?.email}</p>
+                  <div className="flex gap-2">
+                    <span className="px-3 py-1 bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 text-[10px] font-bold uppercase tracking-widest rounded-full border border-blue-100 dark:border-blue-900/40">
+                      Member since {user?.metadata.creationTime ? new Date(user.metadata.creationTime).toLocaleDateString() : "unknown"}
+                    </span>
+                    {isAdmin && (
+                      <span className="px-3 py-1 bg-emerald-50 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400 text-[10px] font-bold uppercase tracking-widest rounded-full border border-emerald-100 dark:border-emerald-900/40">
+                        System Administrator
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                 <div className="md:col-span-2 space-y-6">
+                    <div className="bg-white dark:bg-[#303134] border border-slate-200 dark:border-[#3c4043] rounded-xl shadow-sm overflow-hidden">
+                      <div className="p-4 border-b border-slate-100 dark:border-[#4c5054] bg-slate-50/50 dark:bg-[#202124]/50 flex items-center justify-between">
+                        <h3 className="text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest flex items-center gap-2">
+                          <Clock className="w-3.5 h-3.5" />
+                          Recent Search History
+                        </h3>
+                        {searchHistory.length > 0 && (
+                          <button 
+                            onClick={() => {
+                              if (window.confirm("Are you sure you want to clear your entire search history? This cannot be undone.")) {
+                                clearHistory();
+                              }
+                            }}
+                            className="bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 text-[9px] font-bold px-3 py-1 rounded-full border border-red-100 dark:border-red-900/30 hover:bg-red-100 transition-all uppercase tracking-widest"
+                          >
+                            Clear All History
+                          </button>
+                        )}
+                      </div>
+                      <div className="divide-y divide-slate-50 dark:divide-[#3c4043]">
+                        {searchHistory.length === 0 ? (
+                          <div className="p-12 text-center">
+                            <Search className="w-8 h-8 text-slate-200 dark:text-slate-700 mx-auto mb-3" />
+                            <p className="text-slate-400 dark:text-slate-500 text-sm">Your search history is empty.</p>
+                          </div>
+                        ) : (
+                          searchHistory.map((h, i) => (
+                            <div key={i} className="p-4 flex items-center justify-between hover:bg-slate-50 dark:hover:bg-[#3c4043]/30 transition-all group">
+                              <div className="flex items-center gap-4 flex-1">
+                                <Search className="w-4 h-4 text-slate-300 dark:text-slate-600" />
+                                <span className="text-sm text-slate-700 dark:text-slate-200 font-medium">{h}</span>
+                              </div>
+                              <button 
+                                onClick={() => {
+                                  setQuery(h);
+                                  setView("search");
+                                  handleSearch(undefined, 1, h);
+                                }}
+                                className="px-3 py-1 bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 text-[10px] font-bold uppercase tracking-widest rounded hover:bg-blue-600 hover:text-white transition-all opacity-0 group-hover:opacity-100"
+                              >
+                                Search Again
+                              </button>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </div>
+                 </div>
+
+                 <div className="space-y-6">
+                    <div className="bg-white dark:bg-[#303134] border border-slate-200 dark:border-[#3c4043] rounded-xl p-6 shadow-sm">
+                      <h3 className="text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-4">Account Security</h3>
+                      <div className="space-y-4">
+                        <div className="flex items-center justify-between py-2 border-b border-slate-50 dark:border-[#3c4043]">
+                          <span className="text-sm text-slate-600 dark:text-slate-400">Email Verified</span>
+                          {user?.emailVerified ? (
+                            <CheckCircle className="w-4 h-4 text-emerald-500" />
+                          ) : (
+                            <span className="text-[10px] font-bold text-red-500 uppercase">Unverified</span>
+                          )}
+                        </div>
+                        <div className="flex items-center justify-between py-2">
+                           <span className="text-sm text-slate-600 dark:text-slate-400">Auth Method</span>
+                           <span className="text-[10px] font-bold text-slate-800 dark:text-slate-200 uppercase tracking-wide">Google OAuth</span>
+                        </div>
+                        <button 
+                          onClick={handleLogout}
+                          className="w-full mt-4 py-3 bg-red-50 dark:bg-red-950/20 text-red-600 dark:text-red-400 border border-red-100 dark:border-red-900/30 rounded-lg text-xs font-bold uppercase tracking-widest hover:bg-red-100 transition-all flex items-center justify-center gap-2"
+                        >
+                          <LogOut className="w-4 h-4" />
+                          Sign Out of Account
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="bg-blue-50 dark:bg-blue-900/20 border border-blue-100 dark:border-blue-900/30 rounded-xl p-6 shadow-sm">
+                       <h3 className="text-xs font-bold text-blue-800 dark:text-blue-300 uppercase tracking-widest mb-2 flex items-center gap-2">
+                         <Info className="w-3.5 h-3.5" />
+                         Data Privacy
+                       </h3>
+                       <p className="text-[11px] text-blue-700/80 dark:text-blue-400/80 leading-relaxed">
+                         Your search history is stored securely in your individual user vault. We use this data to improve your search suggestions and ranking relevance. You can clear your data at any time.
+                       </p>
+                    </div>
+                 </div>
               </div>
             </motion.div>
           ) : null}
@@ -1765,7 +2320,7 @@ export default function App() {
                   </button>
                   <button 
                     onClick={() => window.open(viewImage.url, '_blank')}
-                    className="w-full py-3 bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 rounded-lg font-semibold text-sm flex items-center justify-center gap-2 hover:bg-slate-200 dark:hover:bg-slate-700 transition-all"
+                    className="w-full py-3 bg-slate-100 dark:bg-[#303134] text-slate-700 dark:text-slate-300 rounded-lg font-semibold text-sm flex items-center justify-center gap-2 hover:bg-slate-200 dark:hover:bg-[#3c4043] transition-all"
                   >
                     <Layout className="w-4 h-4" />
                     Open Original Image
@@ -1778,7 +2333,7 @@ export default function App() {
       </AnimatePresence>
 
       {/* Footer Status Bar */}
-      <footer className="bg-white dark:bg-slate-900 border-t border-slate-200 dark:border-slate-800 px-8 py-2.5 flex items-center justify-between text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest shrink-0 transition-colors">
+      <footer className="bg-white dark:bg-[#202124] border-t border-slate-200 dark:border-[#3c4043] px-8 py-2.5 flex items-center justify-between text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest shrink-0 transition-colors">
         <div className="flex items-center gap-6">
           <div>Memory Depth: <span className="text-slate-600 dark:text-slate-300">Local Heap</span></div>
           <div>Mode: <span className="text-slate-600 dark:text-slate-300">High-Performance BM25</span></div>
@@ -1788,7 +2343,7 @@ export default function App() {
             <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full"></span>
             Node-01
           </div>
-          <div className="text-slate-500 dark:text-slate-600">ApexIndex Engine • v1.2</div>
+          <div className="text-slate-500 dark:text-slate-600">Webloo Engine core • v1.2</div>
         </div>
       </footer>
     </div>

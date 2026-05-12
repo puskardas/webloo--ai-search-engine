@@ -4,3 +4,19 @@
 @theme {
   --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
 }
+
+@layer base {
+  html {
+    @apply transition-colors duration-500 bg-white dark:bg-[#202124];
+  }
+  
+  body {
+    @apply bg-white dark:bg-[#202124] text-slate-800 dark:text-slate-200;
+  }
+
+  .dark {
+    color-scheme: dark;
+  }
+}
+
+@custom-variant dark (&:where(.dark, .dark *));

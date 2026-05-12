@@ -50,6 +50,31 @@
         "details": { "type": "string", "description": "Additional context or payload" }
       },
       "required": ["adminId", "action", "timestamp"]
+    },
+    "search_history": {
+      "title": "Search History",
+      "description": "User's search history entries.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "query": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "type": { "type": "string", "enum": ["text", "image"] }
+      },
+      "required": ["userId", "query", "timestamp"]
+    },
+    "search_feedback": {
+      "title": "Search Feedback",
+      "description": "User feedback on search result relevance.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "query": { "type": "string" },
+        "resultUrl": { "type": "string" },
+        "isRelevant": { "type": "boolean" },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["query", "resultUrl", "isRelevant", "timestamp"]
     }
   },
   "firestore": {
@@ -64,6 +89,14 @@
     "/audit_logs/{logId}": {
       "schema": "audit_log",
       "description": "Collection of system audit logs."
+    },
+    "/users/{uid}/search_history/{historyId}": {
+      "schema": "search_history",
+      "description": "User's individual search history entries."
+    },
+    "/search_feedback/{feedbackId}": {
+      "schema": "search_feedback",
+      "description": "Collection of user feedback on results."
     }
   }
 }

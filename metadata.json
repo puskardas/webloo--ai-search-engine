@@ -1,6 +1,6 @@
 {
-  "name": "Mini Search Engine",
-  "description": "A high-performance full-stack search engine featuring real-time web crawling, inverted biological indexing, and BM25 relevance ranking.",
+  "name": "Webloo",
+  "description": "A minimalist, hyper-fast search engine with Google-inspired design and powerful indexing capabilities.",
   "requestFramePermissions": [],
   "majorCapabilities": []
 }
