@@ -1,4 +1,4 @@
-# Antigravity Search System (AGSS)
+# WEBLOO
 
 A high-performance, full-stack search engine architecture built from scratch, implementing professional-grade retrieval algorithms, automated web crawling, and AI-powered synthesis.
 
